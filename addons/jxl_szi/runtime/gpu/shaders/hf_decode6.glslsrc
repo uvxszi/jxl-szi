@@ -1,0 +1,280 @@
+// JPEG XL on the GPU (JXL research, X5), G3 v6: hf_decode4 for frames with several passes (cjxl --progressive_ac:
+// each pass group's AC is split into independently coded passes, so 3x the streams, each shorter). A workgroup takes
+// up to 32 pass groups of one (image, pass) - job records are per pass, with that pass's tables, orders and shift.
+// Coefficients go to their natural positions (the pass's coefficient order applied here; its entry for the next
+// coefficient is loaded every symbol, so the load is done by the time a non-zero needs it) and are added
+// atomically when the image has more than one pass (passes add up). The transform kernels then read natural
+// positions (vd8n / vdln).
+#version 450
+
+// SPREAD = lanes per pass group (1, 2, 4, ... 32): the workgroup's 32 groups run on every SPREAD-th lane, so a warp
+// holds 32 / SPREAD of them (fewer threads in a warp waiting on each other's branches)
+// WORK4: workgroups of 256 threads whose spread comes from the work list ([record, first group, count, spread]):
+// the heaviest groups get a workgroup each (spread 256: one active lane, nothing to wait for), the rest go 32 to a
+// workgroup at spread 8, all in one dispatch.
+#ifdef WORK4
+#define SPREAD 8
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#else
+#ifndef SPREAD
+#define SPREAD 1
+#endif
+layout(local_size_x = 32 * SPREAD, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer Bits { uint bits[]; };
+// per group: word offset, start bit, block x0, y0, bit length, list offset, list length, job index
+layout(set = 0, binding = 1, std430) restrict readonly buffer Groups { uint groups[]; };
+layout(set = 0, binding = 2, std430) restrict readonly buffer Tables { uint tables[]; };
+// varblocks per group: x | y << 5 | transform << 10 | block context Y << 15, X << 19, B << 23 | log2 w << 27 |
+// log2 h << 29 (the same for every pass)
+layout(set = 0, binding = 3, std430) restrict readonly buffer BlockList { uint blist[]; };
+layout(set = 0, binding = 4, std430) restrict buffer Coeffs { int coeffs[]; };
+// per job (image), JOB_STRIDE words: see J_* below
+layout(set = 0, binding = 5, std430) restrict readonly buffer Jobs { uint jobs[]; };
+// per workgroup: job index, first group, group count
+layout(set = 0, binding = 6, std430) restrict readonly buffer Work { uint work[]; };
+
+const uint JOB_STRIDE = 64u;
+const uint J_T_CMAP = 0u, J_T_CFG = 1u, J_T_BKT = 2u, J_T_ORD = 4u, J_NBC = 5u, J_LOG_BUCKET = 7u, J_W8 = 8u,
+	J_COEFFS = 10u, J_H8 = 11u, J_ORD_OFS = 12u, J_NUM_CLUSTERS = 33u, J_SHIFT = 34u, J_ATOMIC = 35u;
+const uint ORDER_ID[18] = uint[](0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1, 1, 1, 1, 1);
+const uint TRANSPOSE = 0x571u; // bit per type: 0, 4, 5, 6, 8, 10
+
+const uint COEFF_FREQ_CONTEXT[63] = uint[](
+	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22,
+	22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29,
+	29, 30, 30, 30, 30);
+const uint COEFF_NUM_NONZERO_CONTEXT[63] = uint[](
+	0, 31, 62, 62, 93, 93, 93, 93, 123, 123, 123, 123, 152, 152, 152, 152, 152, 152, 152, 152, 180, 180, 180, 180,
+	180, 180, 180, 180, 180, 180, 180, 180, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
+	206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206);
+
+const uint MAX_BUCKETS = 2048u; // clusters x table length
+const uint MAX_CMAP = 7440u; // 495 x block clusters, one byte each
+shared uvec2 sh_bkt[MAX_BUCKETS];
+shared uint sh_cmap[MAX_CMAP / 4u];
+shared uint sh_cfg[16]; // split_exponent | msb << 8 | lsb << 16
+shared uint sh_freq[64];
+shared uint sh_nzc[64];
+shared uint nzrow8[32 * 24]; // non-zero counts of the row above, a byte each: 96 per thread (3 channels x 32)
+
+uint nz_get(uint i) {
+	return (nzrow8[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+void nz_set(uint i, uint v) {
+	uint sh = (i & 3u) * 8u;
+	nzrow8[i >> 2u] = (nzrow8[i >> 2u] & ~(0xffu << sh)) | (v << sh);
+}
+
+// bit reader: w0 / w1 hold the words at pos and after, w2 the one after that (loaded ahead)
+uint pos, cur, w0, w1, w2;
+
+void bits_start(uint p) {
+	pos = p;
+	cur = p >> 5u;
+	w0 = bits[cur];
+	w1 = bits[cur + 1u];
+	w2 = bits[cur + 2u];
+}
+
+uint read_bits(uint n) {
+	uint s = pos & 31u;
+	uint v = w0 >> s;
+	if (s != 0u) {
+		v |= w1 << (32u - s);
+	}
+	if (n < 32u) {
+		v &= (1u << n) - 1u;
+	}
+	pos += n;
+	if ((pos >> 5u) != cur) {
+		cur++;
+		w0 = w1;
+		w1 = w2;
+		w2 = bits[cur + 2u];
+	}
+	return v;
+}
+
+uint state, log_bucket, table_len;
+
+uint cmap(uint i) {
+	return (sh_cmap[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
+}
+
+// rANS symbol and hybrid uint (jxl-coding read_symbol / read_uint_prefilled)
+uint read_varint(uint cluster) {
+	uint idx = state & 0xfffu;
+	uint i = idx >> log_bucket;
+	uint p = idx & ((1u << log_bucket) - 1u);
+	uvec2 b = sh_bkt[cluster * table_len + i];
+	uint cutoff = (b.x >> 8u) & 0xffu;
+	bool map = p >= cutoff;
+	uint dist = (b.x >> 16u) ^ (map ? b.y >> 16u : 0u);
+	uint offset = p + (map ? b.y & 0xffffu : 0u);
+	uint token = map ? b.x & 0xffu : i;
+	uint next = (state >> 12u) * dist + offset;
+	state = next < 0x10000u ? ((next << 16u) | read_bits(16u)) : next;
+
+	uint cfg = sh_cfg[cluster];
+	uint split_exponent = cfg & 0xffu;
+	uint split = 1u << split_exponent;
+	if (token < split) {
+		return token;
+	}
+	uint msb = (cfg >> 8u) & 0xffu;
+	uint lsb = cfg >> 16u;
+	uint n = (split_exponent - (msb + lsb) + ((token - split) >> (msb + lsb))) & 31u;
+	uint rest = read_bits(n);
+	uint low = token & ((1u << lsb) - 1u);
+	uint top = ((token >> lsb) & ((1u << msb) - 1u)) | (1u << msb);
+	return (((top << n) | rest) << lsb) | low;
+}
+
+void main() {
+#ifdef WORK4
+	uint wg = gl_WorkGroupID.x * 4u;
+	uint spread = work[wg + 3u];
+#else
+	uint wg = gl_WorkGroupID.x * 3u;
+	uint spread = SPREAD;
+#endif
+	uint job = work[wg] * JOB_STRIDE;
+	uint tid = gl_LocalInvocationID.x; // for the table copy: all threads
+	uint lid = tid / spread; // the group slot
+
+	// this image's tables into shared memory
+	uint t_cmap = jobs[job + J_T_CMAP];
+	uint t_cfg = jobs[job + J_T_CFG];
+	uint t_bkt = jobs[job + J_T_BKT];
+	uint nbc = jobs[job + J_NBC];
+	uint nclusters = jobs[job + J_NUM_CLUSTERS];
+	log_bucket = jobs[job + J_LOG_BUCKET];
+	table_len = 1u << (12u - log_bucket);
+	for (uint i = tid; i < nclusters * table_len; i += 32u * SPREAD) {
+		sh_bkt[i] = uvec2(tables[t_bkt + i * 2u], tables[t_bkt + i * 2u + 1u]);
+	}
+	uint ncmap = 495u * nbc;
+	for (uint i = tid; i < (ncmap + 3u) / 4u; i += 32u * SPREAD) {
+		uint v = 0u;
+		for (uint k = 0u; k < 4u; k++) {
+			uint j = i * 4u + k;
+			if (j < ncmap) {
+				v |= tables[t_cmap + j] << (k * 8u);
+			}
+		}
+		sh_cmap[i] = v;
+	}
+	if (tid < nclusters) {
+		uint c = t_cfg + tid * 4u;
+		sh_cfg[tid] = tables[c] | (tables[c + 2u] << 8u) | (tables[c + 3u] << 16u);
+	}
+	for (uint i = tid; i < 63u; i += 32u * SPREAD) {
+		sh_freq[i] = COEFF_FREQ_CONTEXT[i];
+		sh_nzc[i] = COEFF_NUM_NONZERO_CONTEXT[i];
+	}
+	barrier();
+
+	if (lid >= work[wg + 2u] || tid % spread != 0u) {
+		return;
+	}
+	uint gr = (work[wg + 1u] + lid) * 8u;
+	if (spread != 256u && (groups[gr + 7u] >> 31u) != 0u) {
+		return; // a heavy group with a workgroup of its own
+	}
+	bits_start(groups[gr] * 32u + groups[gr + 1u]);
+	uint bx0 = groups[gr + 2u], by0 = groups[gr + 3u];
+	uint end = pos + groups[gr + 4u] + 64u; // a corrupt stream stops here instead of hanging the GPU
+	uint li = groups[gr + 5u];
+	uint lend = li + groups[gr + 6u];
+	uint w8 = jobs[job + J_W8];
+	uint out_base = jobs[job + J_COEFFS];
+	uint stride = w8 * 8u;
+	uint plane = stride * jobs[job + J_H8] * 8u;
+	uint nzbase = lid * 96u;
+	uint t_ord = jobs[job + J_T_ORD];
+	uint shift = jobs[job + J_SHIFT];
+	bool atomic = jobs[job + J_ATOMIC] != 0u;
+	uint ord = 0u;
+	bool transpose = false;
+
+	state = read_bits(32u);
+	uint next_e = li < lend ? blist[li] : 0u; // the next varblock, loaded ahead
+	uint e = 0u, ci = 2u, bx = 0u, by = 0u, lw = 0u, lg = 0u, num_blocks = 1u;
+	uint row = 0u, cbase = 0u, out_c = 0u, k = 0u, nz = 0u, prev = 0u, nzc = 0u, ord_id = 0u;
+	bool want_nz = true; // the next symbol is a varblock channel's non-zero count
+	while (pos < end) {
+		uint cl;
+		if (want_nz) {
+			ci++;
+			if (ci == 3u) {
+				if (li == lend) {
+					break;
+				}
+				ci = 0u;
+				e = next_e;
+				li++;
+				next_e = li < lend ? blist[li] : 0u;
+				bx = e & 31u;
+				by = (e >> 5u) & 31u;
+				lw = (e >> 27u) & 3u;
+				lg = lw + (e >> 29u);
+				num_blocks = 1u << lg;
+				uint dct = (e >> 10u) & 31u;
+				transpose = ((TRANSPOSE >> dct) & 1u) != 0u;
+				ord_id = ORDER_ID[dct];
+			}
+			uint c = ci == 0u ? 1u : (ci == 1u ? 0u : 2u); // decode order Y, X, B
+			uint block_ctx = (e >> (15u + ci * 4u)) & 15u;
+			row = nzbase + c * 32u;
+			uint predicted;
+			if (by == 0u) {
+				predicted = bx == 0u ? 32u : nz_get(row + bx - 1u);
+			} else if (bx == 0u) {
+				predicted = nz_get(row + bx);
+			} else {
+				predicted = (nz_get(row + bx) + nz_get(row + bx - 1u) + 1u) >> 1u;
+			}
+			uint pidx = predicted >= 8u ? 4u + predicted / 2u : predicted;
+			cbase = block_ctx * 458u + 37u * nbc;
+			out_c = out_base + c * plane + (by0 + by) * 8u * stride + (bx0 + bx) * 8u;
+			ord = t_ord + jobs[job + J_ORD_OFS + ord_id * 3u + c];
+			cl = cmap(block_ctx + pidx * nbc);
+		} else {
+			cl = cmap(cbase + (nzc + sh_freq[(k - num_blocks) >> lg]) * 2u + prev);
+		}
+		uint o = want_nz ? 0u : tables[ord + k]; // where coefficient k goes if not zero (used after the decode)
+		uint u = read_varint(cl);
+		if (want_nz) {
+			nz = u;
+			uint nzv = (nz + num_blocks - 1u) >> lg;
+			for (uint dx = 0u; dx < (1u << lw); dx++) {
+				nz_set(row + bx + dx, nzv);
+			}
+			if (nz != 0u) {
+				want_nz = false;
+				prev = nz <= num_blocks * 4u ? 1u : 0u;
+				nzc = sh_nzc[(nz - 1u) >> lg];
+				k = num_blocks;
+			}
+		} else {
+			if (u != 0u) {
+				uint x = o & 0xffffu, y = o >> 16u;
+				uint at = out_c + (transpose ? x * stride + y : y * stride + x);
+				int v = (int(u >> 1u) ^ -int(u & 1u)) << shift;
+				if (atomic) {
+					atomicAdd(coeffs[at], v);
+				} else {
+					coeffs[at] = v;
+				}
+				nz--;
+				nzc = sh_nzc[(max(nz, 1u) - 1u) >> lg];
+			}
+			prev = u != 0u ? 1u : 0u;
+			k++;
+			want_nz = nz == 0u || k == num_blocks * 64u;
+		}
+	}
+}

@@ -1,0 +1,8 @@
+# converter build trees (tools/build_tools.*)
+tools/libjxl/libjxl/
+tools/stager/target/
+
+# a project using the addon from this folder
+.godot/
+.jxl_cache/
+addons/jxl_szi/data/

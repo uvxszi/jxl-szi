@@ -1,0 +1,141 @@
+diff --git a/lib/jxl/enc_ans.cc b/lib/jxl/enc_ans.cc
+index c222a78..e1fe062 100644
+--- a/lib/jxl/enc_ans.cc
++++ b/lib/jxl/enc_ans.cc
+@@ -1181,6 +1181,9 @@ StatusOr<size_t> BuildAndEncodeHistograms(
+           use_prefix_code = true;
+         }
+       }
++      if (params.szi_force_ans && !params.force_huffman) {
++        use_prefix_code = false;
++      }
+       codes->use_prefix_code = use_prefix_code;
+     }
+ 
+diff --git a/lib/jxl/enc_ans_params.h b/lib/jxl/enc_ans_params.h
+index 7cb9080..3345d30 100644
+--- a/lib/jxl/enc_ans_params.h
++++ b/lib/jxl/enc_ans_params.h
+@@ -96,6 +96,8 @@ struct HistogramParams {
+   std::vector<size_t> image_widths;
+   size_t max_histograms = ~0;
+   bool force_huffman = false;
++  // JXL-SZI patch: never switch to prefix codes (small or single-symbol streams stay ANS)
++  bool szi_force_ans = false;
+   bool initialize_global_state = true;
+   bool streaming_mode = false;
+   bool add_missing_symbols = false;
+diff --git a/lib/jxl/enc_frame.cc b/lib/jxl/enc_frame.cc
+index 7e1b92b..59e5930 100644
+--- a/lib/jxl/enc_frame.cc
++++ b/lib/jxl/enc_frame.cc
+@@ -15,8 +15,10 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdlib>
+ #include <memory>
+ #include <numeric>
++#include <string>
+ #include <utility>
+ #include <vector>
+ 
+@@ -259,8 +261,60 @@ Status CopyExtraChannels(JxlChunkedFrameInputSource input, Rect rect,
+   return true;
+ }
+ 
++// JXL-SZI patch: AC passes from the environment, for files whose longest entropy-coded
++// stream (one pass of one 256x256 group) is shorter, which is what a GPU decoder waits for. JXL_SZI_PASSES is a
++// comma-separated list of num_coefficients[:shift] (e.g. "3,5,8": the 3x3, 5x5 and 8x8 squares of each 8x8 area),
++// non-decreasing, ending in 8 with shift 0. Unset: libjxl as released. Every pass still uses libjxl's own per-pass
++// coefficient order (positions that are always zero in a pass go last and are never coded), so the files are
++// ordinary progressive JPEG XL.
++static bool SziPassesFromEnv(ProgressiveMode* mode) {
++  const char* spec = nullptr;
++#ifdef _MSC_VER
++  char* buf = nullptr;
++  size_t len = 0;
++  if (_dupenv_s(&buf, &len, "JXL_SZI_PASSES") != 0 || buf == nullptr) return false;
++  std::string s(buf);
++  free(buf);
++  spec = s.c_str();
++#else
++  spec = std::getenv("JXL_SZI_PASSES");
++  if (spec == nullptr) return false;
++  std::string s(spec);
++  spec = s.c_str();
++#endif
++  ProgressiveMode m;
++  m.num_passes = 0;
++  size_t prev_n = 1, prev_shift = 0;
++  for (const char* p = spec; *p != '\0';) {
++    char* end = nullptr;
++    size_t n = std::strtoul(p, &end, 10);
++    size_t shift = 0;
++    if (end == p) return false;
++    p = end;
++    if (*p == ':') {
++      shift = std::strtoul(p + 1, &end, 10);
++      p = end;
++    }
++    if (*p == ',') p++;
++    if (n < 2 || n > 8 || m.num_passes >= kMaxNumPasses) return false;
++    if (!(n > prev_n || (n == prev_n && shift < prev_shift))) return false;
++    m.passes[m.num_passes++] = PassDefinition{n, shift, kNoDownsamplingFactor};
++    prev_n = n;
++    prev_shift = shift;
++  }
++  if (m.num_passes == 0 || prev_n != 8 || prev_shift != 0) return false;
++  m.passes[m.num_passes - 1].suitable_for_downsampling_of_at_least = 0;
++  *mode = m;
++  return true;
++}
++
+ void SetProgressiveMode(const CompressParams& cparams,
+                         ProgressiveSplitter* progressive_splitter) {
++  ProgressiveMode szi_mode;
++  if (SziPassesFromEnv(&szi_mode)) {
++    progressive_splitter->SetProgressiveMode(szi_mode);
++    return;
++  }
+   constexpr PassDefinition progressive_passes_dc_vlf_lf_full_ac[] = {
+       {/*num_coefficients=*/2, /*shift=*/0,
+        /*suitable_for_downsampling_of_at_least=*/4},
+@@ -1294,6 +1348,21 @@ Status EncodeGlobalACInfo(PassesEncoderState* enc_state, BitWriter* writer,
+     if (enc_state->cparams.decoding_speed_tier >= 1) {
+       hist_params.max_histograms = 6;
+     }
++    {
++      // JXL-SZI patch: JXL_SZI_ANS=1 keeps every AC stream on ANS (a GPU decoder without prefix codes; tiny
++      // passes would otherwise switch to them)
++#ifdef _MSC_VER
++      char* buf = nullptr;
++      size_t len = 0;
++      if (_dupenv_s(&buf, &len, "JXL_SZI_ANS") == 0 && buf != nullptr) {
++        hist_params.szi_force_ans = buf[0] == '1';
++        free(buf);
++      }
++#else
++      const char* v = std::getenv("JXL_SZI_ANS");
++      hist_params.szi_force_ans = v != nullptr && v[0] == '1';
++#endif
++    }
+     size_t num_histogram_groups = shared.num_histograms;
+     if (enc_state->streaming_mode) {
+       size_t prev_num_histograms =
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index 4647b5e..a210f2d 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -142,7 +142,10 @@ elseif (JPEGXL_BUNDLE_LIBPNG)
+   set(PNG_STATIC ON CACHE BOOL "")
+   set(PNG_TOOLS OFF CACHE BOOL "")
+   set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "")
+-  set(ZLIB_INCLUDE_DIR bing_bong_dir)
++  # JXL research build fix: libpng's pnglibconf generator includes zlib.h through ZLIB_INCLUDE_DIR; zlib's own
++  # CMake moves zconf.h to the build tree, so give it zlib.h there too
++  file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/zlib/zlib.h" DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/zlib")
++  set(ZLIB_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/zlib")
+   set(ZLIB_LIBRARY bing_bong_lib)
+   add_library(ZLIB::ZLIB INTERFACE IMPORTED)
+   set(PNG_TESTS OFF CACHE BOOL "")

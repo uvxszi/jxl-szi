@@ -1,0 +1,230 @@
+// JPEG XL on the GPU (JXL research, X5): the 8x8 transforms (Dct8, Dct2, Dct4, Hornuss, Dct4x8 / 8x4, AFV0-3) as
+// jxl-render's generic/transform.rs does them, on a row-major 8x8 array. Inserted at the T8 marker; needs the AFV table before it.
+
+// 1D inverse DCTs on rows / columns of a row-major 8-wide array, n = 4 or 8 points
+void idct_rows(inout float b[64], uint w, uint h) {
+	[[unroll]] for (uint y = 0u; y < 8u; y++) {
+		if (y >= h) {
+			break;
+		}
+		float r[8];
+		[[unroll]] for (uint i = 0u; i < 8u; i++) {
+			float acc = 0.0;
+			[[unroll]] for (uint k = 0u; k < 8u; k++) {
+				if (k < w) {
+					acc += b[y * 8u + k] * idct_basis(k, i, w);
+				}
+			}
+			r[i] = acc;
+		}
+		[[unroll]] for (uint i = 0u; i < 8u; i++) {
+			if (i < w) {
+				b[y * 8u + i] = r[i];
+			}
+		}
+	}
+}
+
+void idct_cols(inout float b[64], uint w, uint h) {
+	[[unroll]] for (uint x = 0u; x < 8u; x++) {
+		if (x >= w) {
+			break;
+		}
+		float r[8];
+		[[unroll]] for (uint i = 0u; i < 8u; i++) {
+			float acc = 0.0;
+			[[unroll]] for (uint k = 0u; k < 8u; k++) {
+				if (k < h) {
+					acc += b[k * 8u + x] * idct_basis(k, i, h);
+				}
+			}
+			r[i] = acc;
+		}
+		[[unroll]] for (uint i = 0u; i < 8u; i++) {
+			if (i < h) {
+				b[i * 8u + x] = r[i];
+			}
+		}
+	}
+}
+
+// a w x h (4 or 8 wide, 4 or 8 tall) block stored 8-wide
+void idct2d(inout float b[64], uint w, uint h) {
+	idct_rows(b, w, h);
+	idct_cols(b, w, h);
+}
+
+void aux_idct2(inout float b[64], uint size) {
+	uint n = size / 2u;
+	float s[64];
+	[[unroll]] for (uint y = 0u; y < 4u; y++) {
+		[[unroll]] for (uint x = 0u; x < 4u; x++) {
+			if (x < n && y < n) {
+				float c00 = b[y * 8u + x];
+				float c01 = b[y * 8u + x + n];
+				float c10 = b[(y + n) * 8u + x];
+				float c11 = b[(y + n) * 8u + x + n];
+				s[2u * y * 8u + 2u * x] = c00 + c01 + c10 + c11;
+				s[2u * y * 8u + 2u * x + 1u] = c00 + c01 - c10 - c11;
+				s[(2u * y + 1u) * 8u + 2u * x] = c00 - c01 + c10 - c11;
+				s[(2u * y + 1u) * 8u + 2u * x + 1u] = c00 - c01 - c10 + c11;
+			}
+		}
+	}
+	[[unroll]] for (uint i = 0u; i < 64u; i++) {
+		if ((i & 7u) < size && (i >> 3u) < size) {
+			b[i] = s[i];
+		}
+	}
+}
+
+void transform_dct2(inout float b[64]) {
+	aux_idct2(b, 2u);
+	aux_idct2(b, 4u);
+	aux_idct2(b, 8u);
+}
+
+void transform_dct4(inout float b[64]) {
+	aux_idct2(b, 2u);
+	float t[64];
+	[[unroll]] for (uint q = 0u; q < 4u; q++) {
+		uint x = q & 1u, y = q >> 1u;
+		float s[64];
+		[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+			[[unroll]] for (uint ix = 0u; ix < 4u; ix++) {
+				s[ix * 8u + iy] = b[(y + iy * 2u) * 8u + x + ix * 2u];
+			}
+		}
+		idct2d(s, 4u, 4u);
+		[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+			[[unroll]] for (uint ix = 0u; ix < 4u; ix++) {
+				t[(y * 4u + iy) * 8u + x * 4u + ix] = s[iy * 8u + ix];
+			}
+		}
+	}
+	b = t;
+}
+
+void transform_hornuss(inout float b[64]) {
+	aux_idct2(b, 2u);
+	float t[64];
+	[[unroll]] for (uint q = 0u; q < 4u; q++) {
+		uint x = q & 1u, y = q >> 1u;
+		float s[16];
+		[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+			[[unroll]] for (uint ix = 0u; ix < 4u; ix++) {
+				s[iy * 4u + ix] = b[(y + iy * 2u) * 8u + x + ix * 2u];
+			}
+		}
+		float residual = 0.0;
+		[[unroll]] for (uint i = 1u; i < 16u; i++) {
+			residual += s[i];
+		}
+		float avg = s[0] - residual / 16.0;
+		s[0] = s[5];
+		s[5] = 0.0;
+		[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+			[[unroll]] for (uint ix = 0u; ix < 4u; ix++) {
+				t[(y * 4u + iy) * 8u + x * 4u + ix] = s[iy * 4u + ix] + avg;
+			}
+		}
+	}
+	b = t;
+}
+
+void transform_dct4x8(inout float b[64], bool tr) {
+	float c0 = b[0], c1 = b[8];
+	b[0] = c0 + c1;
+	b[8] = c0 - c1;
+	float t[64];
+	[[unroll]] for (uint idx = 0u; idx < 2u; idx++) {
+		float s[64];
+		[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+			[[unroll]] for (uint ix = 0u; ix < 8u; ix++) {
+				s[iy * 8u + ix] = b[(iy * 2u + idx) * 8u + ix];
+			}
+		}
+		idct2d(s, 8u, 4u);
+		[[unroll]] for (uint i = 0u; i < 32u; i++) {
+			t[idx * 32u + i] = s[i];
+		}
+	}
+	if (tr) {
+		[[unroll]] for (uint y = 0u; y < 8u; y++) {
+			[[unroll]] for (uint x = 0u; x < 8u; x++) {
+				b[x * 8u + y] = t[y * 8u + x];
+			}
+		}
+	} else {
+		b = t;
+	}
+}
+
+void transform_afv(inout float b[64], uint n) {
+	uint flip_x = n & 1u, flip_y = n >> 1u;
+	float a[16];
+	a[0] = (b[0] + b[1] + b[8]) * 4.0;
+	[[unroll]] for (uint i = 1u; i < 16u; i++) {
+		a[i] = b[(2u * (i >> 2u)) * 8u + 2u * (i & 3u)];
+	}
+	float samples[16];
+	[[unroll]] for (uint j = 0u; j < 16u; j++) {
+		samples[j] = 0.0;
+	}
+	[[unroll]] for (uint i = 0u; i < 16u; i++) {
+		[[unroll]] for (uint j = 0u; j < 16u; j++) {
+			samples[j] = fma(a[i], AFV_BASIS[i * 16u + j], samples[j]);
+		}
+	}
+	float s4[64];
+	s4[0] = b[0] - b[1] + b[8];
+	[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+		[[unroll]] for (uint ix = 0u; ix < 4u; ix++) {
+			if ((ix | iy) != 0u) {
+				s4[ix * 8u + iy] = b[(2u * iy) * 8u + 2u * ix + 1u];
+			}
+		}
+	}
+	idct2d(s4, 4u, 4u);
+	float s48[64];
+	s48[0] = b[0] - b[8];
+	[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+		[[unroll]] for (uint ix = 0u; ix < 8u; ix++) {
+			if ((ix | iy) != 0u) {
+				s48[iy * 8u + ix] = b[(2u * iy + 1u) * 8u + ix];
+			}
+		}
+	}
+	idct2d(s48, 8u, 4u);
+	[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+		uint ay = flip_y == 0u ? iy : 3u - iy;
+		[[unroll]] for (uint ix = 0u; ix < 4u; ix++) {
+			uint ax = flip_x == 0u ? ix : 3u - ix;
+			b[(flip_y * 4u + iy) * 8u + flip_x * 4u + ix] = samples[ay * 4u + ax];
+			b[(flip_y * 4u + iy) * 8u + (1u - flip_x) * 4u + ix] = s4[iy * 8u + ix];
+		}
+	}
+	[[unroll]] for (uint iy = 0u; iy < 4u; iy++) {
+		[[unroll]] for (uint ix = 0u; ix < 8u; ix++) {
+			b[((1u - flip_y) * 4u + iy) * 8u + ix] = s48[iy * 8u + ix];
+		}
+	}
+}
+
+void transform8(inout float v[64], uint dct) {
+	if (dct == 0u) {
+		idct2d(v, 8u, 8u);
+	} else if (dct == 2u) {
+		transform_dct2(v);
+	} else if (dct == 3u) {
+		transform_dct4(v);
+	} else if (dct == 1u) {
+		transform_hornuss(v);
+	} else if (dct == 12u) {
+		transform_dct4x8(v, false);
+	} else if (dct == 13u) {
+		transform_dct4x8(v, true);
+	} else {
+		transform_afv(v, dct - 14u);
+	}
+}

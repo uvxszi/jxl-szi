@@ -1,0 +1,52 @@
+// JPEG XL on the GPU (JXL research, X5), after decoding: the next mip level of every texture at once (dispatch per
+// level: z = texture), buffer to buffer: each texel the average of the 2x2 it covers, in linear light for colour
+// (sRGB flag) so mips don't darken, alpha straight. As x2_gpu_bc/shaders/mip_down.glsl, on RGBA8 words.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer Rgba { uint rgba[]; };
+layout(set = 0, binding = 1, std430) restrict buffer Mips { uint mips[]; };
+// see bc_buf.glsl
+layout(set = 0, binding = 2, std430) restrict readonly buffer Levels { uint lv[]; };
+
+layout(push_constant, std430) uniform Params {
+	uint level;
+	int refine;
+	uint pad0, pad1;
+} params;
+
+vec3 to_linear(vec3 c) {
+	return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+}
+
+vec3 to_srgb(vec3 c) {
+	return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, greaterThan(c, vec3(0.0031308)));
+}
+
+void main() {
+	uint e = (gl_GlobalInvocationID.z * 16u + params.level) * 12u;
+	uint w = lv[e + 2u], h = lv[e + 3u];
+	uvec2 p = gl_GlobalInvocationID.xy;
+	if (w == 0u || p.x >= w || p.y >= h) {
+		return;
+	}
+	bool srgb = lv[e + 5u] != 0u;
+	uint psel = lv[e + 8u], pofs = lv[e + 9u], pw = lv[e + 10u], ph = lv[e + 11u];
+	vec4 sum = vec4(0.0);
+	for (uint i = 0u; i < 4u; i++) {
+		uvec2 s = min(p * 2u + uvec2(i & 1u, i >> 1u), uvec2(pw - 1u, ph - 1u));
+		uint v = psel == 0u ? rgba[pofs + s.y * pw + s.x] : mips[pofs + s.y * pw + s.x];
+		vec4 c = vec4(float(v & 255u), float((v >> 8u) & 255u), float((v >> 16u) & 255u), float(v >> 24u)) / 255.0;
+		if (srgb) {
+			c.rgb = to_linear(c.rgb);
+		}
+		sum += c;
+	}
+	sum *= 0.25;
+	if (srgb) {
+		sum.rgb = to_srgb(sum.rgb);
+	}
+	uvec4 q = uvec4(round(clamp(sum, 0.0, 1.0) * 255.0));
+	mips[lv[e + 1u] + p.y * w + p.x] = q.r | (q.g << 8u) | (q.b << 16u) | (q.a << 24u);
+}

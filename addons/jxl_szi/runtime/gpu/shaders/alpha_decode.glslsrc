@@ -1,0 +1,296 @@
+// JPEG XL on the GPU (JXL research, X5): the alpha channel. In a VarDCT file alpha is modular data that follows
+// the HF coefficients in each pass group; the converter records where (so the CPU stager could parse each group's
+// header, local MA tree and histograms with jxl-oxide, into a plan + tables: stager plan_alpha). Here one thread
+// per pass group decodes the samples: rANS or prefix codes, hybrid uints, the single-leaf tree's predictor (zero or
+// gradient), then the palette inverse when there is one, into an 8-bit alpha plane (4 pixels a word). Independent
+// of the HF decode, so it can run alongside it. Checked on the CPU by stager/src/bin/alphacheck.rs.
+#version 450
+
+#ifndef SPREAD
+#define SPREAD 8
+#endif
+#ifndef NO_STAB
+#define STAB
+#endif
+// SLOTS: pass groups a workgroup (shared memory ~2.75 KB a slot with STAB: 16 -> 44 KB; 8 for GPUs with 32 KB)
+#ifndef SLOTS
+#define SLOTS 16
+#endif
+layout(local_size_x = SLOTS * SPREAD, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer Bits { uint bits[]; };
+// per group, APL_STRIDE words: data bit, kind (0 ANS / 1 prefix / 2 constant / 3 CPU rows), tables offset, clusters, log bucket
+// size, channels, palette colours, x0, y0, w, h, alpha plane base (words), then per channel w, h, cluster,
+// predictor, offset, multiplier (from word 12), at word 30 the plane stride (words a row) and at word 31 a constant
+// group's value
+layout(set = 0, binding = 1, std430) restrict readonly buffer Plans { uint apl[]; };
+layout(set = 0, binding = 2, std430) restrict readonly buffer Tables { uint at[]; };
+layout(set = 0, binding = 3, std430) restrict buffer Alpha { uint aout[]; };
+// rows decoded on the CPU (stager alpha_cpu) for kind 3 groups: ceil(w / 4) words a row from word 31's offset
+layout(set = 0, binding = 4, std430) restrict readonly buffer AData { uint adata[]; };
+
+layout(push_constant, std430) uniform Params {
+	uint count;
+	uint pad0, pad1, pad2;
+} params;
+
+const uint APL_STRIDE = 32u;
+
+// per slot, packed so that more workgroups fit an SM: the row above (16-bit samples, two a word) and the palette
+// (8-bit colours, clamped as the image's alpha is anyway, four a word)
+shared uint srow[uint(SLOTS) * 128u];
+shared uint spal[uint(SLOTS) * 64u];
+
+uint pos, cur, w0, w1, w2;
+
+void bits_start(uint p) {
+	pos = p;
+	cur = p >> 5u;
+	w0 = bits[cur];
+	w1 = bits[cur + 1u];
+	w2 = bits[cur + 2u];
+}
+
+uint peek(uint n) {
+	uint s = pos & 31u;
+	uint v = s == 0u ? w0 : (w0 >> s) | (w1 << (32u - s));
+	return n >= 32u ? v : v & ((1u << n) - 1u);
+}
+
+void skip(uint n) {
+	pos += n;
+	if ((pos >> 5u) != cur) {
+		cur++;
+		w0 = w1;
+		w1 = w2;
+		w2 = bits[cur + 2u];
+	}
+}
+
+uint read_bits(uint n) {
+	uint v = peek(n);
+	skip(n);
+	return v;
+}
+
+bool prefix;
+uint tbase, nclusters, log_bucket, table_len, state;
+uint ptab[16]; // prefix: each cluster's table offset
+
+// the channel being decoded: its cluster's table and hybrid uint config, loaded once a channel (use_cluster)
+uint ctab, c_split, c_se, c_msb, c_lsb, top_bits, top_n;
+#ifdef STAB
+// STAB: the ANS table in shared memory (at most 256 entries, 2 words each), a slot's own
+shared uint stab[uint(SLOTS) * 512u];
+uint sslot;
+#endif
+
+void use_cluster(uint cl) {
+	uint c = tbase + cl * 4u;
+	c_se = at[c];
+	c_split = at[c + 1u];
+	c_msb = at[c + 2u];
+	c_lsb = at[c + 3u];
+	if (prefix) {
+		ctab = ptab[cl];
+		top_bits = at[ctab];
+		top_n = at[ctab + 1u];
+	} else {
+		ctab = tbase + nclusters * 4u + cl * table_len * 2u;
+#ifdef STAB
+		for (uint i = 0u; i < table_len * 2u; i++) {
+			stab[sslot * 512u + i] = at[ctab + i];
+		}
+		ctab = sslot * 512u;
+#endif
+	}
+}
+
+uint token() {
+	if (prefix) {
+		uint peeked = peek(15u);
+		uint e = at[ctab + 3u + (peeked & ((1u << top_bits) - 1u))];
+		if ((e & 1u) != 0u) {
+			uint ofs = (e >> 16u) + ((peeked >> top_bits) & ((e >> 8u) & 0xffu));
+			e = at[ctab + 3u + top_n + ofs];
+		}
+		skip((e >> 8u) & 0xffu);
+		return e >> 16u;
+	}
+	uint idx = state & 0xfffu;
+	uint i = idx >> log_bucket;
+	uint p = idx & ((1u << log_bucket) - 1u);
+	uint b = ctab + i * 2u;
+#ifdef STAB
+	uint lo = stab[b];
+	uint hi = stab[b + 1u];
+#else
+	uint lo = at[b];
+	uint hi = at[b + 1u];
+#endif
+	bool map = p >= ((lo >> 8u) & 0xffu);
+	uint dist = (lo >> 16u) ^ (map ? hi >> 16u : 0u);
+	uint offset = p + (map ? hi & 0xffffu : 0u);
+	uint tok = map ? lo & 0xffu : i;
+	uint next = (state >> 12u) * dist + offset;
+	state = next < 0x10000u ? ((next << 16u) | read_bits(16u)) : next;
+	return tok;
+}
+
+uint varint() {
+	uint tok = token();
+	if (tok < c_split) {
+		return tok;
+	}
+	uint n = (c_se - (c_msb + c_lsb) + ((tok - c_split) >> (c_msb + c_lsb))) & 31u;
+	uint rest = read_bits(n);
+	uint low = tok & ((1u << c_lsb) - 1u);
+	uint top = ((tok >> c_lsb) & ((1u << c_msb) - 1u)) | (1u << c_msb);
+	return (((top << n) | rest) << c_lsb) | low;
+}
+
+int unpack(uint v) {
+	return int(v >> 1u) ^ -int(v & 1u);
+}
+
+const int DELTA0[72] = int[](
+	0, 4, 11, 0, 0, -10, -18, -27, -18, 0, -32, -37, 0, 24, 50, -45, -24, 0, -34, -24, -45, 64, -32, 0, -32,
+	-24, 45, 24, -45, 80, 64, 0, 0, -24, 96, 64, 45, 34, 112, 24, 45, 0, 24, 0, 45, 24, -24, 0, 96, 128, 64,
+	144, 96, -36, 45, 45, 0, 0, 0, 45, -128, 24, -45, 64, 64, 96, 45, 24, 64, 128, 0, -24);
+
+// palette inverse for one 8-bit channel, no deltas, Zero delta predictor
+int palette_value(uint slot, uint ncol, int index) {
+	int n = int(ncol);
+	if (index >= 0 && index < n) {
+		return int((spal[slot * 64u + (uint(index) >> 2u)] >> ((uint(index) & 3u) * 8u)) & 0xffu);
+	}
+	if (index >= n) {
+		int i = index - n;
+		return i < 64 ? (i % 4) * 255 / 4 + 32 : ((i - 64) % 5) * 255 / 4;
+	}
+	int i = (-(index + 1)) % 143;
+	int v = DELTA0[(i + 1) >> 1];
+	return (i & 1) == 0 ? -v : v;
+}
+
+void main() {
+	uint tid = gl_LocalInvocationID.x;
+	uint slot = tid / SPREAD;
+#ifdef STAB
+	sslot = slot;
+#endif
+	uint g = gl_WorkGroupID.x * uint(SLOTS) + slot;
+	if (g >= params.count) {
+		return;
+	}
+	uint r = g * APL_STRIDE;
+	uint kind = apl[r + 1u];
+	if (kind >= 2u) {
+		// a constant group (2: the converter recorded its one value) or one decoded on the CPU (3: its rows): the
+		// slot's lanes fill / copy it, a row each in turn
+		uint fill = apl[r + 31u] * 0x01010101u;
+		uint words = (apl[r + 9u] + 3u) >> 2u;
+		uint astride = apl[r + 30u];
+		uint base = apl[r + 11u] + apl[r + 8u] * astride + (apl[r + 7u] >> 2u);
+		for (uint y = tid % SPREAD; y < apl[r + 10u]; y += SPREAD) {
+			for (uint i = 0u; i < words; i++) {
+				aout[base + y * astride + i] = kind == 2u ? fill : adata[apl[r + 31u] + y * words + i];
+			}
+		}
+		return;
+	}
+	if (tid % SPREAD != 0u) {
+		return;
+	}
+	bits_start(apl[r]);
+	prefix = apl[r + 1u] == 1u;
+	tbase = apl[r + 2u];
+	nclusters = apl[r + 3u];
+	log_bucket = apl[r + 4u];
+	table_len = 1u << (12u - log_bucket);
+	if (prefix) {
+		uint o = tbase + nclusters * 4u;
+		for (uint c = 0u; c < nclusters && c < 16u; c++) {
+			ptab[c] = o;
+			o += 3u + at[o + 1u] + at[o + 2u];
+		}
+	} else {
+		state = read_bits(32u);
+	}
+	uint nch = apl[r + 5u];
+	uint ncol = apl[r + 6u];
+	uint x0 = apl[r + 7u], y0 = apl[r + 8u];
+	uint plane = apl[r + 11u];
+	uint astride = apl[r + 30u];
+	uint sb = slot * 128u;
+	for (uint ch = 0u; ch < nch; ch++) {
+		uint cr = r + 12u + ch * 6u;
+		uint w = apl[cr], h = apl[cr + 1u], cl = apl[cr + 2u], pred = apl[cr + 3u];
+		use_cluster(cl);
+		int offset = int(apl[cr + 4u]);
+		int mul = int(apl[cr + 5u]);
+		bool is_palette = ncol > 0u && ch == 0u; // the palette's colours (one row)
+		bool is_image = ch == nch - 1u;
+		for (uint y = 0u; y < h; y++) {
+			int wv = 0, nwv = 0;
+			uint word = 0u;
+			uint nword = 0u; // the row above at an even x and the next
+			uint pend = 0u; // this row's sample at the last even x, until its pair is decoded
+			for (uint x = 0u; x < w; x++) {
+				int p = 0;
+				if (pred != 0u) {
+					if ((x & 1u) == 0u) {
+						nword = srow[sb + (x >> 1u)];
+					}
+					int above = int(nword << ((~x & 1u) * 16u)) >> 16; // the half for x, sign-extended
+					int nv = y > 0u ? above : 0;
+					if (x == 0u) {
+						wv = nv; // W = N at the left edge (0 on the first row)
+						nwv = nv;
+					}
+					if (y == 0u) {
+						nv = wv;
+						nwv = wv;
+					}
+					p = clamp(wv + nv - nwv, min(wv, nv), max(wv, nv));
+					nwv = nv;
+				}
+				int v = p + unpack(varint()) * mul + offset;
+#ifdef DEBUG_COL0
+				if (g == 0u && x == 0u && is_image && y < 8u) {
+					aout[4096u * 8u + y * 4u] = uint(v);
+					aout[4096u * 8u + y * 4u + 1u] = uint(p);
+					aout[4096u * 8u + y * 4u + 2u] = uint(word);
+					aout[4096u * 8u + y * 4u + 3u] = 0xC0FFEEu;
+				}
+#endif
+				if (pred != 0u) {
+					// the word for x - 1, x is written once both are decoded (after x's N was read)
+					if ((x & 1u) == 0u) {
+						pend = uint(v) & 0xffffu;
+						if (x == w - 1u) {
+							srow[sb + (x >> 1u)] = pend;
+						}
+					} else {
+						srow[sb + (x >> 1u)] = pend | (uint(v) << 16u);
+					}
+					wv = v;
+				}
+				if (is_palette) {
+					word |= uint(clamp(v, 0, 255)) << ((x & 3u) * 8u);
+					if ((x & 3u) == 3u || x == w - 1u) {
+						spal[slot * 64u + (x >> 2u)] = word;
+						word = 0u;
+					}
+				} else if (is_image) {
+					int a = ncol > 0u ? palette_value(slot, ncol, v) : v;
+					word |= uint(clamp(a, 0, 255)) << ((x & 3u) * 8u);
+					if ((x & 3u) == 3u || x == w - 1u) {
+						aout[plane + (y0 + y) * astride + ((x0 + x) >> 2u)] = word;
+						word = 0u;
+					}
+				}
+			}
+		}
+	}
+}

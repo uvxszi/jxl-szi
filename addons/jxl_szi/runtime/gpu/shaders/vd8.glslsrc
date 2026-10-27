@@ -1,0 +1,93 @@
+// JPEG XL on the GPU (JXL research, X5), G4 v2: one workgroup per 8x8-class varblock (the job's small list), one
+// thread per pixel. Each thread gathers its natural position's coefficient in X, Y and B, dequantizes, adds chroma
+// from luma (same position, so no sharing needed) and puts the LF value at (0, 0); then every pixel is a dot
+// product with the transform's 64x64 matrix (vd_basis) for the three channels, converted to RGBA8 on the spot.
+// Replaces vd_small + vd_color (no XYB planes).
+#version 450
+#define PRM_SHARED
+#define PRM_SLOTS 4
+
+// 4 blocks to a workgroup (64 threads each): a quarter of the workgroups to launch
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+//COMMON
+
+shared float cf[4 * 3 * 64];
+
+float coeff_at(uint c, uint p, uint oid, uint tr, uint dct, uint base, uint stride, uint plane, float mul, float qbn) {
+#ifdef NATURAL
+	uint k = p; // hf_decode6 put the coefficients in place
+#else
+	uint k = data[PRM(P_IORD) + PRM(P_IORDOFS + (oid * 3u + c) * 2u + tr) + p];
+#endif
+	int q = coeffs[base + c * plane + (k >> 3u) * stride + (k & 7u)];
+	float m = uintBitsToFloat(data[PRM(P_MATS) + PRM(P_MATOFS + dct * 3u + c) + p]);
+	return dequant(q, m, mul * prmf(P_QM + c), prmf(P_QBIAS + c), qbn);
+}
+
+void main() {
+	// one dispatch for all images: push.job = the list's offset in the input buffer, push.count = entries,
+	// push.pad0 = workgroups per dispatch row; an entry is [x | y << 16, transform | job << 8]
+	uint sub = gl_LocalInvocationID.x >> 6u; // which of the workgroup's 4 blocks
+	uint wgi = (gl_WorkGroupID.y * push.pad0 + gl_WorkGroupID.x) * 4u + sub;
+	bool live = wgi < push.count;
+	uint ent = push.job + min(wgi, push.count - 1u) * 2u;
+	jb = (data[ent + 1u] >> 8u) * VSTRIDE;
+	uint p = gl_LocalInvocationID.x & 63u;
+	uint cfb = sub * 192u;
+	sp_base = sub * VSTRIDE;
+	for (uint i = p; i < VSTRIDE; i += 64u) {
+		sp[sp_base + i] = prm[jb + i];
+	}
+	barrier();
+	uint pos = data[ent];
+	uint dct = data[ent + 1u] & 255u;
+	uint bx = pos & 0xffffu, by = pos >> 16u;
+	uint w8 = PRM(P_W8), h8 = PRM(P_H8);
+	uint stride = w8 * 8u;
+	uint plane = stride * h8 * 8u;
+	uint bi = by * w8 + bx;
+#ifdef NATURAL
+	uint hf_mul = data[PRM(P_HFMUL) + bi];
+#else
+	uint hf_mul = data[PRM(P_BLOCKS) + bi * 2u + 1u];
+#endif
+	uint oid = ORDER_ID[dct];
+	uint tr = (TRANSPOSE >> dct) & 1u;
+	uint base = PRM(P_COEFFS) + by * 8u * stride + bx * 8u;
+	float mul = 65536.0 / (prmf(P_GSCALE) * float(hf_mul));
+	float qbn = prmf(P_QBN);
+	float vy = coeff_at(1u, p, oid, tr, dct, base, stride, plane, mul, qbn);
+	float vx = coeff_at(0u, p, oid, tr, dct, base, stride, plane, mul, qbn);
+	float vb = coeff_at(2u, p, oid, tr, dct, base, stride, plane, mul, qbn);
+	uint tile = (by >> 3u) * PRM(P_CW) + (bx >> 3u);
+	float cfd = prmf(P_CF);
+	vx += (prmf(P_BCX) + float(int(data[PRM(P_CFL) + tile])) / cfd) * vy;
+	vb += (prmf(P_BCB) + float(int(data[PRM(P_CFL) + PRM(P_CFLPLANE) + tile])) / cfd) * vy;
+	if (p == 0u) {
+		uint lf = PRM(P_LF) + bi;
+		vx = uintBitsToFloat(data[lf]);
+		vy = uintBitsToFloat(data[lf + w8 * h8]);
+		vb = uintBitsToFloat(data[lf + 2u * w8 * h8]);
+	}
+	cf[cfb + p] = vx;
+	cf[cfb + 64u + p] = vy;
+	cf[cfb + 128u + p] = vb;
+	barrier();
+	if (!live) {
+		return;
+	}
+	uint mat = C_MAT8 + (dct < 4u ? dct : dct - 8u) * 4096u + p;
+	float ox = 0.0, oy = 0.0, ob = 0.0;
+	for (uint k = 0u; k < 64u; k++) {
+		float m = consts[mat + k * 64u];
+		ox = fma(cf[cfb + k], m, ox);
+		oy = fma(cf[cfb + 64u + k], m, oy);
+		ob = fma(cf[cfb + 128u + k], m, ob);
+	}
+	uint px = bx * 8u + (p & 7u), py = by * 8u + (p >> 3u);
+	uint width = PRM(P_WIDTH);
+	if (px < width && py < PRM(P_HEIGHT)) {
+		rgba[PRM(P_RGBA) + py * width + px] = xyb_to_rgba8(ox, oy, ob, alpha_at(px, py));
+	}
+}

@@ -1,0 +1,151 @@
+// JPEG XL on the GPU (JXL research, X5), G4: shared by the VarDCT reconstruction kernels (vd_small, vd_large,
+// vd_color). Inserted after "#version 450" by the loader. Per image ("job") a params record (VSTRIDE words, P_*);
+// everything else per image sits in one input buffer at the offsets the record gives (blocks, LF, CfL maps,
+// dequant matrices, inverse coefficient orders, large-varblock list).
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer Params { uint prm[]; };
+layout(set = 0, binding = 1, std430) restrict readonly buffer Input { uint data[]; };
+// HF coefficients as hf_decode4 / 5 leave them: per varblock in decode order over its area
+layout(set = 0, binding = 2, std430) restrict readonly buffer Coeffs { int coeffs[]; };
+// XYB planes (written by vd_small / vd_large, read by vd_color) ...
+layout(set = 0, binding = 3, std430) restrict buffer Xyb { float xyb[]; };
+// ... and the RGBA8 result (vd_color)
+layout(set = 0, binding = 4, std430) restrict writeonly buffer Rgba { uint rgba[]; };
+
+// shared tables: the 8x8 transforms as 64x64 matrices (vd_basis.glsl), inverse DCT bases for 8 / 16 / 32 points
+#ifdef CONSTS_WRITABLE
+layout(set = 0, binding = 5, std430) restrict buffer Consts { float consts[]; };
+#else
+layout(set = 0, binding = 5, std430) restrict readonly buffer Consts { float consts[]; };
+#endif
+const uint C_MAT8 = 0u, C_COS8 = 40960u, C_COS16 = 41024u, C_COS32 = 41280u, C_SIZE = 42304u;
+
+// the alpha planes (alpha_decode.glsl): 8-bit, 4 pixels a word
+layout(set = 0, binding = 6, std430) restrict readonly buffer AlphaPlane { uint aplane[]; };
+
+layout(push_constant, std430) uniform Push {
+	uint job;
+	uint count;
+	uint pad0;
+	uint pad1;
+} push;
+
+const uint VSTRIDE = 192u;
+// params record: offsets are in words (input buffer / coeffs / xyb / rgba), floats as bits
+const uint P_W8 = 0u, P_H8 = 1u, P_BLOCKS = 2u, P_COEFFS = 3u, P_XYB = 4u, P_LF = 5u, P_CFL = 6u, P_MATS = 7u,
+	P_IORD = 8u, P_CW = 9u, P_BIG = 10u, P_NBIG = 11u, P_WIDTH = 12u, P_HEIGHT = 13u, P_RGBA = 14u, P_CFLPLANE = 15u,
+	P_QM = 16u, P_QBIAS = 19u, P_QBN = 22u, P_GSCALE = 23u, P_BCX = 24u, P_BCB = 25u, P_CF = 26u,
+	P_INVMAT = 27u, P_OBIAS = 36u, P_ITSCALE = 39u,
+	P_MATOFS = 40u, // 27 transform types x 3 channels
+	P_IORDOFS = 121u, // 7 order ids x 3 channels x 2 orientations
+	P_SMALL = 163u, P_NSMALL = 164u, P_CBRT_OBIAS = 165u, P_HFMUL = 168u,
+	P_ALPHA = 169u, P_ASTRIDE = 170u; // this image's alpha plane (0xffffffff: none) and its words a row
+
+// per transform type (0-17, up to 32x32): order id, log2 width / height in blocks, coefficients transposed
+const uint ORDER_ID[18] = uint[](0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1, 1, 1, 1, 1);
+const uint LOG_W[18] = uint[](0, 0, 0, 0, 1, 2, 0, 1, 0, 2, 1, 2, 0, 0, 0, 0, 0, 0);
+const uint LOG_H[18] = uint[](0, 0, 0, 0, 1, 2, 1, 0, 2, 0, 2, 1, 0, 0, 0, 0, 0, 0);
+const uint TRANSPOSE = 0x571u; // bit per type: 0, 4, 5, 6, 8, 10
+
+const float SQRT2 = 1.4142135623730951;
+const float PI = 3.141592653589793;
+
+uint jb; // this job's params record
+
+// PRM_SHARED: the workgroup copies its job's record(s) into shared memory first (one round of parallel loads
+// instead of chains of dependent ones); PRM(i) then reads it there. PRM_SLOTS records, sp_base picks one.
+#ifdef PRM_SHARED
+#ifndef PRM_SLOTS
+#define PRM_SLOTS 1
+#endif
+shared uint sp[PRM_SLOTS * 192];
+uint sp_base = 0u;
+#define PRM(i) sp[sp_base + (i)]
+#else
+#define PRM(i) prm[jb + (i)]
+#endif
+
+float prmf(uint i) {
+	return uintBitsToFloat(PRM(i));
+}
+
+// jxl-render dequant_hf_varblock: bias, matrix, scale
+float dequant(int q, float m, float mul, float qbias, float qbn) {
+	float v = float(q);
+	if (abs(v) <= 1.0) {
+		v *= qbias;
+	} else {
+		v -= qbn / v;
+	}
+	return v * m * mul;
+}
+
+// scale_f(c, logb) of jxl-render for the LLF coefficients of a varblock with 2^(5 - logb) blocks on that side
+float llf_scale(uint c, uint log_blocks) {
+	const float SCALE_F[4] = float[](1.0, 0.9748868211368796, 0.9017641950288744, 0.7870549181591013);
+	// SCALE_F[c << (5 - log_blocks)] with c < 2^log_blocks, of the 32-entry table: entries 0, 8, 16, 24
+	return SCALE_F[(c << (5u - log_blocks)) >> 3u];
+}
+
+// forward DCT basis (jxl-oxide's normalisation: mean for k = 0, sqrt 2 / n scaled cosines above)
+float fdct_basis(uint k, uint i, uint n) {
+	float c = cos(PI * float(k) * float(2u * i + 1u) / float(2u * n));
+	return k == 0u ? 1.0 / float(n) : SQRT2 * c / float(n);
+}
+
+// inverse DCT basis: out[i] = in[0] + sqrt 2 * sum in[k] cos(pi k (2i + 1) / 2n)
+float idct_basis(uint k, uint i, uint n) {
+	return k == 0u ? 1.0 : SQRT2 * cos(PI * float(k) * float(2u * i + 1u) / float(2u * n));
+}
+
+// --- colour: XYB -> linear sRGB -> sRGB, as jxl-color (xyb.rs, the opsin inverse matrix, tf/srgb.rs's fast curve
+// ported bit for bit) -> RGBA8 (alpha 255)
+
+const uint SRGB_UPPER[16] = uint[](0x00u, 0x0au, 0x19u, 0x26u, 0x32u, 0x41u, 0x4du, 0x5cu, 0x68u, 0x75u, 0x83u, 0x8fu,
+	0xa0u, 0xaau, 0xb9u, 0xc6u);
+const uint SRGB_LOWER[16] = uint[](0x00u, 0xb7u, 0x04u, 0x0du, 0xcbu, 0xe7u, 0x41u, 0x68u, 0x51u, 0xd1u, 0xebu, 0xf2u,
+	0x00u, 0xb7u, 0x04u, 0x0du);
+
+float linear_to_srgb(float s) {
+	uint v = floatBitsToUint(s) & 0x7fffffffu;
+	float v_adj = uintBitsToFloat((v | 0x3e800000u) & 0x3effffffu);
+	float p = 0.059914046 * v_adj - 0.10889456;
+	p = p * v_adj + 0.107963754;
+	p = p * v_adj + 0.018092343;
+	uint idx = ((v >> 23u) - 118u) & 15u;
+	uint mul = 0x40000000u | (SRGB_UPPER[idx] << 18u) | (SRGB_LOWER[idx] << 10u);
+	float vf = uintBitsToFloat(v);
+	float r = vf <= 0.0031308 ? vf * 12.92 : p * uintBitsToFloat(mul) - 0.055;
+	return s < 0.0 ? -r : r;
+}
+
+uint to8(float v) {
+	return uint(clamp(v * 255.0 + 0.5, 0.0, 255.0));
+}
+
+// the image's alpha at a pixel (255 when it has none)
+uint alpha_at(uint px, uint py) {
+	uint base = PRM(P_ALPHA);
+	if (base == 0xffffffffu) {
+		return 255u;
+	}
+	return (aplane[base + py * PRM(P_ASTRIDE) + (px >> 2u)] >> ((px & 3u) * 8u)) & 0xffu;
+}
+
+uint xyb_to_rgba8(float vx, float vy, float vb, uint a) {
+	vec3 ob = vec3(prmf(P_OBIAS), prmf(P_OBIAS + 1u), prmf(P_OBIAS + 2u));
+	vec3 cb = vec3(prmf(P_CBRT_OBIAS), prmf(P_CBRT_OBIAS + 1u), prmf(P_CBRT_OBIAS + 2u)); // cube roots (CPU side)
+	float itscale = prmf(P_ITSCALE);
+	float gL = vy + vx - cb.x;
+	float gm = vy - vx - cb.y;
+	float gs = vb - cb.z;
+	float l = fma(gL * gL, gL, ob.x) * itscale;
+	float m = fma(gm * gm, gm, ob.y) * itscale;
+	float s = fma(gs * gs, gs, ob.z) * itscale;
+	vec3 rgb;
+	rgb.r = prmf(P_INVMAT + 0u) * l + prmf(P_INVMAT + 1u) * m + prmf(P_INVMAT + 2u) * s;
+	rgb.g = prmf(P_INVMAT + 3u) * l + prmf(P_INVMAT + 4u) * m + prmf(P_INVMAT + 5u) * s;
+	rgb.b = prmf(P_INVMAT + 6u) * l + prmf(P_INVMAT + 7u) * m + prmf(P_INVMAT + 8u) * s;
+	uint r8 = to8(linear_to_srgb(rgb.r)), g8 = to8(linear_to_srgb(rgb.g)), b8 = to8(linear_to_srgb(rgb.b));
+	return r8 | (g8 << 8u) | (b8 << 16u) | (a << 24u);
+}

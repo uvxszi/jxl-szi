@@ -1,0 +1,29 @@
+[package]
+name = "stager"
+version = "0.1.0"
+edition = "2024"
+description = "JXL-SZI converter step 2: annotates cjxl output with the boxes the Godot runtime reads (pass group ends, constant alpha groups, the staged GPU job), from a patched jxl-oxide"
+
+[dependencies]
+jxl-oxide = "0.12.6"
+jxl-render = "=0.12.4"
+serde_json = "1"
+rayon = "1"
+miniz_oxide = "0.8"
+zune-inflate = "0.2"
+jxl-vardct = "=0.11.1"
+jxl-modular = "=0.11.3"
+jxl-frame = "=0.13.3"
+jxl-bitstream = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[patch.crates-io]
+jxl-render = { path = "patched/jxl-render" }
+jxl-coding = { path = "patched/jxl-coding" }
+jxl-vardct = { path = "patched/jxl-vardct" }
+jxl-modular = { path = "patched/jxl-modular" }
+jxl-frame = { path = "patched/jxl-frame" }
+
+[profile.release]
+opt-level = 3

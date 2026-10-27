@@ -1,0 +1,452 @@
+// JXL-SZI: block-compress every texture's mip levels at once, from the RGBA8 buffers (level 0 from vd8 / vdl2, the
+// rest from mip_buf) into one buffer, each mip chain in its final layout. Dispatch per mip level: z = texture,
+// xy = 4x4 block.
+// Default: BC1 (colour), BC3 (BC4 alpha + BC1), BC5 (two BC4 channels). With ETC (GPUs without BC, phones): ETC2 RGB8,
+// ETC2 RGBA8 (EAC alpha + ETC2) and EAC RG11, the same block sizes.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) restrict readonly buffer Rgba { uint rgba[]; };
+layout(set = 0, binding = 1, std430) restrict readonly buffer Mips { uint mips[]; };
+// per texture and level (16 levels a texture, 12 words each): this level's buffer (0 rgba, 1 mips), offset, w, h,
+// mode (0 colour, 1 colour + alpha, 2 normal map), sRGB, this level's word offset in the output, 0, the previous
+// level's buffer, offset, w, h
+layout(set = 0, binding = 2, std430) restrict readonly buffer Levels { uint lv[]; };
+layout(set = 0, binding = 3, std430) restrict writeonly buffer BlocksOut { uint bout[]; };
+
+layout(push_constant, std430) uniform Params {
+	uint level;
+	int refine;
+	uint pad0, pad1;
+} params;
+
+#ifndef ETC
+
+// --- BC1 colour block (always the 4-colour mode: c0 > c1) ---------------------------------------------------------
+
+uint pack565(vec3 c) {
+	uvec3 q = uvec3(round(clamp(c, 0.0, 1.0) * vec3(31.0, 63.0, 31.0)));
+	return (q.r << 11) | (q.g << 5) | q.b;
+}
+
+vec3 unpack565(uint v) {
+	return vec3(float((v >> 11) & 31u), float((v >> 5) & 63u), float(v & 31u)) / vec3(31.0, 63.0, 31.0);
+}
+
+// Principal axis of the colours (power iteration on the covariance), for endpoints along the block's main spread.
+vec3 axis3(vec3 c[16], vec3 mean) {
+	mat3 m = mat3(0.0);
+	for (int i = 0; i < 16; i++) {
+		vec3 d = c[i] - mean;
+		m += outerProduct(d, d);
+	}
+	vec3 v = vec3(0.577, 0.577, 0.577);
+	for (int k = 0; k < 6; k++) {
+		vec3 n = m * v;
+		float l = length(n);
+		if (l < 1e-8) {
+			return vec3(0.577, 0.577, 0.577);
+		}
+		v = n / l;
+	}
+	return v;
+}
+
+uvec2 encode_bc1(vec3 c[16], int refine) {
+	vec3 mean = vec3(0.0);
+	for (int i = 0; i < 16; i++) {
+		mean += c[i];
+	}
+	mean /= 16.0;
+	vec3 ax = axis3(c, mean);
+	float tmin = 1e9;
+	float tmax = -1e9;
+	for (int i = 0; i < 16; i++) {
+		float t = dot(c[i] - mean, ax);
+		tmin = min(tmin, t);
+		tmax = max(tmax, t);
+	}
+	vec3 e0 = clamp(mean + ax * tmax, 0.0, 1.0);
+	vec3 e1 = clamp(mean + ax * tmin, 0.0, 1.0);
+	uint c0 = 0u;
+	uint c1 = 0u;
+	uint idx = 0u;
+	uvec2 best_block = uvec2(0u);
+	float best_err = 1e30;
+	for (int pass = 0; pass <= refine; pass++) {
+		c0 = pack565(e0);
+		c1 = pack565(e1);
+		if (c0 < c1) {
+			uint t = c0;
+			c0 = c1;
+			c1 = t;
+		}
+		if (c0 == c1) {
+			// a flat block: every texel the one colour (4-colour mode needs c0 > c1; nudge one endpoint)
+			if (c0 > 0u) {
+				c1 = c0 - 1u;
+			} else {
+				c0 = 1u;
+			}
+		}
+		vec3 p0 = unpack565(c0);
+		vec3 p1 = unpack565(c1);
+		vec3 pal[4] = vec3[4](p0, p1, (2.0 * p0 + p1) / 3.0, (p0 + 2.0 * p1) / 3.0);
+		float wt[4] = float[4](1.0, 0.0, 2.0 / 3.0, 1.0 / 3.0); // weight of p0
+		idx = 0u;
+		float err = 0.0;
+		float aa = 0.0;
+		float ab = 0.0;
+		float bb = 0.0;
+		vec3 ax0 = vec3(0.0);
+		vec3 bx0 = vec3(0.0);
+		for (int i = 0; i < 16; i++) {
+			uint best = 0u;
+			float bd = 1e9;
+			for (uint j = 0u; j < 4u; j++) {
+				vec3 d = c[i] - pal[j];
+				float e = dot(d, d);
+				if (e < bd) {
+					bd = e;
+					best = j;
+				}
+			}
+			err += bd;
+			idx |= best << (2u * uint(i));
+			float w = wt[best];
+			aa += w * w;
+			ab += w * (1.0 - w);
+			bb += (1.0 - w) * (1.0 - w);
+			ax0 += w * c[i];
+			bx0 += (1.0 - w) * c[i];
+		}
+		if (err < best_err) {
+			best_err = err;
+			best_block = uvec2(c0 | (c1 << 16), idx);
+		}
+		if (pass < refine) {
+			// least squares: the two endpoints that best fit these indices (skipped when the texels all sit on one
+			// weight: then the system has no single answer and rounding would throw the endpoints far off)
+			float det = aa * bb - ab * ab;
+			if (det <= 1e-3 * aa * bb || det <= 1e-8) {
+				break;
+			}
+			e0 = clamp((ax0 * bb - bx0 * ab) / det, 0.0, 1.0);
+			e1 = clamp((bx0 * aa - ax0 * ab) / det, 0.0, 1.0);
+		}
+	}
+	return best_block;
+}
+
+// --- BC4 single-channel block (8-value mode: a0 > a1) -------------------------------------------------------------
+
+uvec2 encode_bc4(float v[16]) {
+	float mn = 1.0;
+	float mx = 0.0;
+	for (int i = 0; i < 16; i++) {
+		mn = min(mn, v[i]);
+		mx = max(mx, v[i]);
+	}
+	uint a0 = uint(round(mx * 255.0));
+	uint a1 = uint(round(mn * 255.0));
+	if (a0 == a1) {
+		return uvec2(a0 | (a1 << 8), 0u); // every texel index 0 = a0
+	}
+	uint w0 = a0 | (a1 << 8);
+	uint w1 = 0u;
+	float span = float(a0) - float(a1);
+	for (int i = 0; i < 16; i++) {
+		float t = (v[i] * 255.0 - float(a1)) / span * 7.0; // 0 = a1 ... 7 = a0
+		uint k = uint(clamp(round(t), 0.0, 7.0));
+		uint code = k == 7u ? 0u : (k == 0u ? 1u : 8u - k);
+		uint bit = 16u + 3u * uint(i);
+		if (bit + 3u <= 32u) {
+			w0 |= code << bit;
+		} else if (bit >= 32u) {
+			w1 |= code << (bit - 32u);
+		} else {
+			w0 |= code << bit;
+			w1 |= code >> (32u - bit);
+		}
+	}
+	return uvec2(w0, w1);
+}
+
+#else
+
+// --- ETC2 / EAC ------------------------------------------------------------------------------------------------------
+// Colour: ETC2's ETC1-compatible modes (individual and differential, both flips; T, H and planar are never written):
+// each half of the block has a base colour and one of 8 modifier tables, picked to fit best. Alpha (ETC2 RGBA8) and
+// each channel of a normal map (EAC RG11): EAC, a base, a multiplier and one of 16 modifier tables. Texel codes go in
+// column order (texel k = x * 4 + y); a block's bytes are big-endian, hence bswap for the little-endian words.
+
+const int ETC_MOD[32] = int[32](2, 8, -2, -8, 5, 17, -5, -17, 9, 29, -9, -29, 13, 42, -13, -42,
+	18, 60, -18, -60, 24, 80, -24, -80, 33, 106, -33, -106, 47, 183, -47, -183);
+
+const int EAC_MOD[128] = int[128](
+	-3, -6, -9, -15, 2, 5, 8, 14,
+	-3, -7, -10, -13, 2, 6, 9, 12,
+	-2, -5, -8, -13, 1, 4, 7, 12,
+	-2, -4, -6, -13, 1, 3, 5, 12,
+	-3, -6, -8, -12, 2, 5, 7, 11,
+	-3, -7, -9, -11, 2, 6, 8, 10,
+	-4, -7, -8, -11, 3, 6, 7, 10,
+	-3, -5, -8, -11, 2, 4, 7, 10,
+	-2, -6, -8, -10, 1, 5, 7, 9,
+	-2, -5, -8, -10, 1, 4, 7, 9,
+	-2, -4, -8, -10, 1, 3, 7, 9,
+	-2, -5, -7, -10, 1, 4, 6, 9,
+	-3, -4, -7, -10, 2, 3, 6, 9,
+	-1, -2, -3, -10, 0, 1, 2, 9,
+	-4, -6, -8, -9, 3, 5, 7, 8,
+	-3, -5, -7, -9, 2, 4, 6, 8);
+
+uint bswap(uint x) {
+	return (x >> 24u) | ((x >> 8u) & 0xff00u) | ((x << 8u) & 0xff0000u) | (x << 24u);
+}
+
+// The best modifier table for half `s` of the block (flip 0: the left / right 2x4 halves, 1: top / bottom 4x2) on
+// base colour `b`: its error and the texels' 2-bit codes as msb / lsb bit planes.
+void etc_half(ivec3 q[16], uint flip, uint s, ivec3 b, out uint table, out uint msb, out uint lsb, out int err) {
+	err = 0x7fffffff;
+	table = 0u;
+	msb = 0u;
+	lsb = 0u;
+	for (uint t = 0u; t < 8u; t++) {
+		int e = 0;
+		uint m = 0u;
+		uint l = 0u;
+		for (uint i = 0u; i < 16u; i++) {
+			uint x = i & 3u;
+			uint y = i >> 2u;
+			if ((flip == 0u ? x >> 1u : y >> 1u) != s) {
+				continue;
+			}
+			int bd = 0x7fffffff;
+			uint bj = 0u;
+			for (uint j = 0u; j < 4u; j++) {
+				ivec3 d = clamp(b + ivec3(ETC_MOD[t * 4u + j]), ivec3(0), ivec3(255)) - q[i];
+				int dd = d.x * d.x + d.y * d.y + d.z * d.z;
+				if (dd < bd) {
+					bd = dd;
+					bj = j;
+				}
+			}
+			e += bd;
+			uint k = x * 4u + y;
+			m |= (bj >> 1u) << k;
+			l |= (bj & 1u) << k;
+		}
+		if (e < err) {
+			err = e;
+			table = t;
+			msb = m;
+			lsb = l;
+		}
+	}
+}
+
+uvec2 encode_etc(vec3 c[16]) {
+	ivec3 q[16];
+	for (int i = 0; i < 16; i++) {
+		q[i] = ivec3(round(clamp(c[i], 0.0, 1.0) * 255.0));
+	}
+	int best = 0x7fffffff;
+	uvec2 block = uvec2(0u);
+	for (uint flip = 0u; flip < 2u; flip++) {
+		vec3 avg0 = vec3(0.0);
+		vec3 avg1 = vec3(0.0);
+		for (uint i = 0u; i < 16u; i++) {
+			if ((flip == 0u ? (i & 3u) >> 1u : i >> 3u) == 0u) {
+				avg0 += vec3(q[i]);
+			} else {
+				avg1 += vec3(q[i]);
+			}
+		}
+		avg0 /= 8.0;
+		avg1 /= 8.0;
+		// differential (5-bit bases, the second within -4..3 of the first) when the halves are close, else individual
+		// (4-bit bases)
+		ivec3 a0 = ivec3(round(avg0 * (31.0 / 255.0)));
+		ivec3 a1 = ivec3(round(avg1 * (31.0 / 255.0)));
+		ivec3 d = a1 - a0;
+		bool diff = all(greaterThanEqual(d, ivec3(-4))) && all(lessThanEqual(d, ivec3(3)));
+		ivec3 b0;
+		ivec3 b1;
+		if (diff) {
+			b0 = (a0 << 3) | (a0 >> 2);
+			b1 = (a1 << 3) | (a1 >> 2);
+		} else {
+			a0 = ivec3(round(avg0 * (15.0 / 255.0)));
+			a1 = ivec3(round(avg1 * (15.0 / 255.0)));
+			b0 = a0 * 17;
+			b1 = a1 * 17;
+		}
+		uint t0, m0, l0, t1, m1, l1;
+		int e0, e1;
+		etc_half(q, flip, 0u, b0, t0, m0, l0, e0);
+		etc_half(q, flip, 1u, b1, t1, m1, l1, e1);
+		if (e0 + e1 < best) {
+			best = e0 + e1;
+			uint hdr;
+			if (diff) {
+				uvec3 dd = uvec3((d + 8) & 7); // the 3-bit two's complement deltas
+				hdr = (uint(a0.r) << 27u) | (dd.r << 24u) | (uint(a0.g) << 19u) | (dd.g << 16u) | (uint(a0.b) << 11u) | (dd.b << 8u);
+			} else {
+				hdr = (uint(a0.r) << 28u) | (uint(a1.r) << 24u) | (uint(a0.g) << 20u) | (uint(a1.g) << 16u) | (uint(a0.b) << 12u) | (uint(a1.b) << 8u);
+			}
+			hdr |= (t0 << 5u) | (t1 << 2u) | ((diff ? 1u : 0u) << 1u) | flip;
+			block = uvec2(bswap(hdr), bswap(((m0 | m1) << 16u) | (l0 | l1)));
+		}
+	}
+	return block;
+}
+
+// An EAC value: ETC2 alpha (0..255: base + modifier * multiplier) or R11 (0..2047: base * 8 + 4 + modifier *
+// multiplier * 8).
+float eac_value(bool r11, int b, int mod, int m) {
+	return r11 ? clamp(float(b * 8 + 4 + mod * m * 8), 0.0, 2047.0) : clamp(float(b + mod * m), 0.0, 255.0);
+}
+
+// One EAC block for 16 values (0..1, row order): for each table the multiplier that spans the values (and its
+// neighbours) and the base that centres them; the best fit wins.
+uvec2 encode_eac(float v[16], bool r11) {
+	float top = r11 ? 2047.0 : 255.0;
+	float scale = r11 ? 8.0 : 1.0;
+	float tv[16];
+	float mn = 1e9;
+	float mx = -1e9;
+	for (int i = 0; i < 16; i++) {
+		tv[i] = clamp(v[i], 0.0, 1.0) * top;
+		mn = min(mn, tv[i]);
+		mx = max(mx, tv[i]);
+	}
+	float best = 1e30;
+	int bb = 0;
+	int bm = 1;
+	uint bt = 0u;
+	for (uint t = 0u; t < 16u; t++) {
+		float lo = float(EAC_MOD[t * 8u + 3u]);
+		float hi = float(EAC_MOD[t * 8u + 7u]);
+		int m0 = clamp(int(round((mx - mn) / ((hi - lo) * scale))), 1, 15);
+		for (int dm = -1; dm <= 1; dm++) {
+			int m = m0 + dm;
+			if (m < 1 || m > 15) {
+				continue;
+			}
+			float centre = (mx + mn) * 0.5 - (hi + lo) * 0.5 * float(m) * scale;
+			int b = clamp(int(round(r11 ? (centre - 4.0) / 8.0 : centre)), 0, 255);
+			float e = 0.0;
+			for (int i = 0; i < 16 && e < best; i++) {
+				float bd = 1e30;
+				for (uint j = 0u; j < 8u; j++) {
+					float dv = eac_value(r11, b, EAC_MOD[t * 8u + j], m) - tv[i];
+					bd = min(bd, dv * dv);
+				}
+				e += bd;
+			}
+			if (e < best) {
+				best = e;
+				bb = b;
+				bm = m;
+				bt = t;
+			}
+		}
+	}
+	uint hi32 = (uint(bb) << 24u) | (uint(bm) << 20u) | (bt << 16u);
+	uint lo32 = 0u;
+	for (uint i = 0u; i < 16u; i++) {
+		float bd = 1e30;
+		uint bj = 0u;
+		for (uint j = 0u; j < 8u; j++) {
+			float dv = eac_value(r11, bb, EAC_MOD[bt * 8u + j], bm) - tv[i];
+			if (dv * dv < bd) {
+				bd = dv * dv;
+				bj = j;
+			}
+		}
+		uint k = (i & 3u) * 4u + (i >> 2u);
+		uint pos = 45u - 3u * k; // the code's lowest bit in the 48 index bits
+		if (pos >= 32u) {
+			hi32 |= bj << (pos - 32u);
+		} else {
+			lo32 |= bj << pos;
+			if (pos > 29u) {
+				hi32 |= bj >> (32u - pos);
+			}
+		}
+	}
+	return uvec2(bswap(hi32), bswap(lo32));
+}
+
+#endif
+
+// --- main ---------------------------------------------------------------------------------------------------------
+
+vec4 texel(uint sel, uint ofs, uint x, uint y, uint w) {
+	uint v = sel == 0u ? rgba[ofs + y * w + x] : mips[ofs + y * w + x];
+	return vec4(float(v & 255u), float((v >> 8u) & 255u), float((v >> 16u) & 255u), float(v >> 24u)) / 255.0;
+}
+
+void main() {
+	uint e = (gl_GlobalInvocationID.z * 16u + params.level) * 12u;
+	uint w = lv[e + 2u], h = lv[e + 3u];
+	ivec2 blk = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 blocks = (ivec2(w, h) + 3) / 4;
+	if (w == 0u || blk.x >= blocks.x || blk.y >= blocks.y) {
+		return;
+	}
+	uint sel = lv[e], ofs = lv[e + 1u], mode = lv[e + 4u];
+	uint at = lv[e + 6u] + (uint(blk.y) * uint(blocks.x) + uint(blk.x)) * (mode == 0u ? 2u : 4u);
+	vec4 px[16];
+	for (int i = 0; i < 16; i++) {
+		uvec2 p = min(uvec2(blk * 4 + ivec2(i & 3, i >> 2)), uvec2(w - 1u, h - 1u));
+		px[i] = texel(sel, ofs, p.x, p.y, w);
+	}
+	if (mode == 0u) {
+		vec3 c[16];
+		for (int i = 0; i < 16; i++) {
+			c[i] = px[i].rgb;
+		}
+#ifdef ETC
+		uvec2 q = encode_etc(c);
+#else
+		uvec2 q = encode_bc1(c, params.refine);
+#endif
+		bout[at] = q.x;
+		bout[at + 1u] = q.y;
+	} else if (mode == 1u) {
+		vec3 c[16];
+		float a[16];
+		for (int i = 0; i < 16; i++) {
+			c[i] = px[i].rgb;
+			a[i] = px[i].a;
+		}
+#ifdef ETC
+		uvec4 q = uvec4(encode_eac(a, false), encode_etc(c));
+#else
+		uvec4 q = uvec4(encode_bc4(a), encode_bc1(c, params.refine));
+#endif
+		bout[at] = q.x;
+		bout[at + 1u] = q.y;
+		bout[at + 2u] = q.z;
+		bout[at + 3u] = q.w;
+	} else {
+		float r[16];
+		float g[16];
+		for (int i = 0; i < 16; i++) {
+			r[i] = px[i].r;
+			g[i] = px[i].g;
+		}
+#ifdef ETC
+		uvec4 q = uvec4(encode_eac(r, true), encode_eac(g, true));
+#else
+		uvec4 q = uvec4(encode_bc4(r), encode_bc4(g));
+#endif
+		bout[at] = q.x;
+		bout[at + 1u] = q.y;
+		bout[at + 2u] = q.z;
+		bout[at + 3u] = q.w;
+	}
+}

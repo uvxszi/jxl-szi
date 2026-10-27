@@ -1,0 +1,196 @@
+// JPEG XL on the GPU (JXL research, X5), G4 v3: the varblocks larger than 8x8, one workgroup of 256 threads per
+// varblock (the job's large list). vdl was bound by shared-memory bandwidth (two shared loads per multiply-add);
+// here each thread keeps the DCT basis column it needs in registers, reads coefficients four at a time (vec4), and
+// the row pass writes its results transposed so the column pass reads contiguous vec4s too:
+// gather + dequantize + chroma from luma -> LLF from the LF samples -> rows -> columns + colour -> RGBA8.
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#define PRM_SHARED
+#ifndef CUT
+#define CUT 0
+#endif
+
+#ifndef THREADS
+#define THREADS 256
+#endif
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+//COMMON
+
+// MAX512: only varblocks of up to 512 pixels (no 32x32 / 32x8 / 8x32), half the shared memory: more workgroups
+// fit an SM
+#ifdef MAX512
+const uint SA_C = 512u, SB_C = 640u; // floats a channel: w * h, and w * (h + 4) for the transposed rows
+#else
+const uint SA_C = 1024u, SB_C = 1152u;
+#endif
+shared vec4 sa[3u * SA_C / 4u]; // [c][y][x] row-major, the coefficients (then the LLF)
+shared vec4 sb[3u * SB_C / 4u]; // the row results transposed: [c][x][y], columns padded to h + 4 (fewer bank conflicts)
+shared float slf[48]; // the varblock's LF samples [c][y][x] (up to 4x4)
+
+// forward DCT basis (jxl-oxide's normalisation) for 1, 2 and 4 points: FDCT[n_index][k * 4 + i]
+const float FDCT2[4] = float[](0.5, 0.5, 0.5, -0.5);
+const float FDCT4[16] = float[](
+	0.25, 0.25, 0.25, 0.25,
+	0.3266407412190941, 0.1352990250365493, -0.1352990250365493, -0.3266407412190941,
+	0.25, -0.25, -0.25, 0.25,
+	0.1352990250365493, -0.3266407412190941, 0.3266407412190941, -0.1352990250365493);
+
+float fdct_small(uint k, uint i, uint n) {
+	return n == 1u ? 1.0 : (n == 2u ? FDCT2[k * 2u + i] : FDCT4[k * 4u + i]);
+}
+
+void put_a(uint i, float v) {
+	sa[i >> 2u][i & 3u] = v;
+}
+
+void put_b(uint i, float v) {
+	sb[i >> 2u][i & 3u] = v;
+}
+
+void main() {
+	// one dispatch for all images: push.job = the list's offset in the input buffer, push.count = entries,
+	// push.pad0 = workgroups per dispatch row; an entry is [x | y << 16, transform | job << 8]
+	uint wgi = gl_WorkGroupID.y * push.pad0 + gl_WorkGroupID.x;
+	if (wgi >= push.count) {
+		return;
+	}
+	uint ent = push.job + wgi * 2u;
+	jb = (data[ent + 1u] >> 8u) * VSTRIDE;
+	uint lid = gl_LocalInvocationID.x;
+	for (uint i = lid; i < VSTRIDE; i += uint(THREADS)) {
+		sp[i] = prm[jb + i];
+	}
+	barrier();
+	uint pos = data[ent];
+	uint dct = data[ent + 1u] & 255u;
+	uint bx = pos & 0xffffu, by = pos >> 16u;
+	uint w8 = PRM(P_W8), h8 = PRM(P_H8);
+	uint lw = LOG_W[dct], lh = LOG_H[dct];
+	uint wsh = 3u + lw, hsh = 3u + lh;
+	uint w = 8u << lw, h = 8u << lh, n = w * h;
+	uint stride = w8 * 8u;
+	uint plane = stride * h8 * 8u;
+	uint hf_mul = data[PRM(P_HFMUL) + by * w8 + bx];
+
+#if CUT == 1
+	for (uint p = lid; p < n; p += uint(THREADS)) {
+		rgba[PRM(P_RGBA) + (by * 8u + (p >> wsh)) * PRM(P_WIDTH) + bx * 8u + (p & (w - 1u))] = 0xff000000u;
+	}
+	return;
+#endif
+	// gather + dequant + chroma from luma
+	uint bw = 1u << lw, bh = 1u << lh;
+	if (lid < 3u * bw * bh) {
+		// the LF samples, one load each, alongside the gather
+		uint c = lid / (bw * bh);
+		uint kk = lid % (bw * bh);
+		slf[lid] = uintBitsToFloat(data[PRM(P_LF) + c * w8 * h8 + (by + kk / bw) * w8 + bx + kk % bw]);
+	}
+	float qbn = prmf(P_QBN);
+	float mul = 65536.0 / (prmf(P_GSCALE) * float(hf_mul));
+	uint base = PRM(P_COEFFS) + by * 8u * stride + bx * 8u;
+	uint cw = PRM(P_CW);
+	uint cfl = PRM(P_CFL);
+	uint cflplane = PRM(P_CFLPLANE);
+	float cfd = prmf(P_CF);
+	for (uint p = lid; p < n; p += uint(THREADS)) {
+		float v[3];
+		for (uint c = 0u; c < 3u; c++) {
+			int q = coeffs[base + c * plane + (p >> wsh) * stride + (p & (w - 1u))];
+			float m = uintBitsToFloat(data[PRM(P_MATS) + PRM(P_MATOFS + dct * 3u + c) + p]);
+			v[c] = dequant(q, m, mul * prmf(P_QM + c), prmf(P_QBIAS + c), qbn);
+		}
+		uint gx = bx * 8u + (p & (w - 1u)), gy = by * 8u + (p >> wsh);
+		uint tile = (gy >> 6u) * cw + (gx >> 6u);
+		put_a(p, v[0] + (prmf(P_BCX) + float(int(data[cfl + tile])) / cfd) * v[1]);
+		put_a(SA_C + p, v[1]);
+		put_a(2u * SA_C + p, v[2] + (prmf(P_BCB) + float(int(data[cfl + cflplane + tile])) / cfd) * v[1]);
+	}
+	barrier();
+#if CUT == 2
+	for (uint p = lid; p < n; p += uint(THREADS)) {
+		rgba[PRM(P_RGBA) + (by * 8u + (p >> wsh)) * PRM(P_WIDTH) + bx * 8u + (p & (w - 1u))] = floatBitsToUint(sa[p >> 2u][p & 3u]);
+	}
+	return;
+#endif
+	// LLF from the LF samples: forward DCT of the bw x bh LF block, scaled
+	if (CUT != 5 && lid < 3u * bw * bh) {
+		uint c = lid / (bw * bh);
+		uint kk = lid % (bw * bh);
+		uint kx = kk % bw, ky = kk / bw;
+		float acc = 0.0;
+		for (uint y = 0u; y < bh; y++) {
+			for (uint x = 0u; x < bw; x++) {
+				acc += slf[c * bw * bh + y * bw + x] * fdct_small(kx, x, bw) * fdct_small(ky, y, bh);
+			}
+		}
+		put_a(c * SA_C + ky * w + kx, acc / (llf_scale(ky, lh) * llf_scale(kx, lw)));
+	}
+	barrier();
+	uint cw_ofs = w == 8u ? C_COS8 : (w == 16u ? C_COS16 : C_COS32);
+	uint ch_ofs = h == 8u ? C_COS8 : (h == 16u ? C_COS16 : C_COS32);
+	// rows: thread -> output column i of rows y0, y0 + ystep, ...: sb[c][i][y] = sum_k sa[c][y][k] * basis_w[k][i]
+	{
+		uint i = lid & (w - 1u);
+		uint y0 = lid >> wsh;
+		uint ystep = uint(THREADS) >> wsh;
+		float cb[32];
+		[[unroll]] for (uint k = 0u; k < 32u; k++) {
+			cb[k] = k < w ? consts[cw_ofs + k * w + i] : 0.0;
+		}
+		for (uint c = 0u; c < 3u; c++) {
+			for (uint y = y0; y < h; y += ystep) {
+				uint row = (c * SA_C + y * w) >> 2u;
+				float acc = 0.0;
+				[[unroll]] for (uint kq = 0u; kq < 8u; kq++) {
+					if (kq * 4u < w) {
+						vec4 a = sa[row + kq];
+						acc += a.x * cb[kq * 4u] + a.y * cb[kq * 4u + 1u] + a.z * cb[kq * 4u + 2u] + a.w * cb[kq * 4u + 3u];
+					}
+				}
+				put_b(c * SB_C + i * (h + 4u) + y, acc);
+			}
+		}
+	}
+	barrier();
+#if CUT == 3
+	for (uint p = lid; p < n; p += uint(THREADS)) {
+		rgba[PRM(P_RGBA) + (by * 8u + (p >> wsh)) * PRM(P_WIDTH) + bx * 8u + (p & (w - 1u))] = floatBitsToUint(sb[p >> 2u][p & 3u]);
+	}
+	return;
+#endif
+	// columns: thread -> output row y of columns x0, x0 + xstep, ...: all three channels, then colour
+	uint width = PRM(P_WIDTH), height = PRM(P_HEIGHT);
+	{
+		uint y = lid & (h - 1u);
+		uint x0 = lid >> hsh;
+		uint xstep = uint(THREADS) >> hsh;
+		float cb[32];
+		[[unroll]] for (uint k = 0u; k < 32u; k++) {
+			cb[k] = k < h ? consts[ch_ofs + k * h + y] : 0.0;
+		}
+		for (uint x = x0; x < w; x += xstep) {
+			float o[3];
+			for (uint c = 0u; c < 3u; c++) {
+				uint col = (c * SB_C + x * (h + 4u)) >> 2u;
+				float acc = 0.0;
+				[[unroll]] for (uint kq = 0u; kq < 8u; kq++) {
+					if (kq * 4u < h) {
+						vec4 a = sb[col + kq];
+						acc += a.x * cb[kq * 4u] + a.y * cb[kq * 4u + 1u] + a.z * cb[kq * 4u + 2u] + a.w * cb[kq * 4u + 3u];
+					}
+				}
+				o[c] = acc;
+			}
+			uint px = bx * 8u + x, py = by * 8u + y;
+			if (px < width && py < height) {
+#if CUT == 4
+				rgba[PRM(P_RGBA) + py * width + px] = floatBitsToUint(o[0] + o[1] + o[2]);
+#else
+				rgba[PRM(P_RGBA) + py * width + px] = xyb_to_rgba8(o[0], o[1], o[2], alpha_at(px, py));
+#endif
+			}
+		}
+	}
+}
