@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 (2026-10-26)
+
+- **Normal maps get their own distance:** Project Settings > Jxl Szi > Converter > Normal Map Distance, default
+  0.35 (colour stays at 1.0). Normal maps keep much more detail (34.3 -> 39.5 dB over the sample game's 45, now
+  ahead of Basis Universal at the same size), for a ~8% bigger build. They convert again on the first export.
+- **Benchmarks:** a comparison with `.ctex` and Basis Universal, and a normal-map distance table, in the README.
+
 ## 0.1.0 (2026-10-26)
 
 The first packaged version. It's experimental.

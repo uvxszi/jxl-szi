@@ -3,7 +3,7 @@ extends EditorPlugin
 ## JXL-SZI: ship your VRAM textures as JPEG XL, decoded on the GPU at runtime. Enabling the plugin adds the JxlSzi
 ## autoload (kept first, so it hands out textures before anything else loads one) and the export (export_plugin.gd),
 ## which only acts on presets with the custom feature `jxl-szi`.
-## Settings: Project Settings > General > Jxl Szi (converter distance, boot paths and script); Editor Settings > Jxl
+## Settings: Project Settings > General > Jxl Szi (converter distances, boot paths and script); Editor Settings > Jxl
 ## Szi > Converter > Custom Tools Dir (Advanced Settings on; only for your own builds of the tools).
 
 const AUTOLOAD := "JxlSzi"
@@ -44,7 +44,8 @@ func _settings() -> void:
 		es.set_setting(tools, "")
 	es.set_initial_value(tools, "", false)
 	es.add_property_info({ name = tools, type = TYPE_STRING, hint = PROPERTY_HINT_GLOBAL_DIR })
-	_project_setting(export_plugin.DISTANCE_SETTING, 1.0, { type = TYPE_FLOAT, hint = PROPERTY_HINT_RANGE, hint_string = "0.1,5.0,0.05" })
+	_project_setting(export_plugin.DISTANCE_SETTING, 1.0, { type = TYPE_FLOAT, hint = PROPERTY_HINT_RANGE, hint_string = "0.05,5.0,0.05" })
+	_project_setting(export_plugin.NORMAL_DISTANCE_SETTING, 0.35, { type = TYPE_FLOAT, hint = PROPERTY_HINT_RANGE, hint_string = "0.05,5.0,0.05" })
 	_project_setting(export_plugin.BOOT_PATHS, PackedStringArray(), { type = TYPE_PACKED_STRING_ARRAY,
 		hint = PROPERTY_HINT_TYPE_STRING, hint_string = "%d/%d:" % [TYPE_STRING, PROPERTY_HINT_FILE] })
 	_project_setting(export_plugin.BOOT_SCRIPT, "", { type = TYPE_STRING, hint = PROPERTY_HINT_FILE, hint_string = "*.gd" })

@@ -15,7 +15,7 @@ matter. The IDs match the ones in the code's comments.
 
 | | Godot `.ctex` | JXL-SZI |
 |---|---|---|
-| Windows .exe | 470 MB | 257 MB |
+| Windows .exe (normal maps at 1.0; 291 MB at 0.35) | 470 MB | 257 MB |
 | zip / 7z of the build (F36) | 200 / 159 MB | 177 / 150 MB |
 | FPS, D3D12 / Vulkan | 235.6 / 233.4 | 235.6 / 233.7 |
 | 1% low, D3D12 / Vulkan | 221.9 / 195.3 | 224.5 / 198.0 |
@@ -30,7 +30,7 @@ matter. The IDs match the ones in the code's comments.
 - **Peak memory:** higher for the first ~1.5 s, while the boot set decodes.
 - **Startup:** about 50-80 ms slower from a warm cache, about the same from a fast NVMe, and 0.2-0.4 s faster from
   slower drives, because there are fewer bytes to read.
-- **Size:** about half on disk. The gain shrinks once compressed, because BC data compresses well and JPEG XL
+- **Size:** about half on disk (about 40% smaller with normal maps at distance 0.35). The gain shrinks once compressed, because BC data compresses well and JPEG XL
   doesn't.
 
 ## Why the GPU
@@ -164,13 +164,19 @@ matter. The IDs match the ones in the code's comments.
 
 The sample game exported from one project three ways, measured on Windows / D3D12, one run each (README has the
 table):
-- **Size:** `.ctex` 493 MB, Basis (Godot's defaults: UASTC level 0, no RDO) 331 MB, JXL-SZI 269 MB.
+- **Size:** `.ctex` 493 MB, Basis (Godot's defaults: UASTC level 0, no RDO) 331 MB, JXL-SZI 269 MB (291 MB with
+  normal maps at 0.35).
 - **Loading:** Basis transcodes on the CPU during scene loads. Its menu came 0.6-0.7 s later than `.ctex`, the trial
   map 1.1-1.25 s later, and the trial-start freeze was 845-1121 ms against 486 ms. JXL-SZI was within 30-40 ms of
   `.ctex`.
 - **FPS:** the same for all three, ~236.8 when focused.
 - **Quality, PSNR of the top mip against the source over 60 textures:** Basis 47.0 dB (Godot transcodes it to BC7
   on desktops: colour 55.1), `.ctex` 45.5, JXL-SZI 39.0 with BC / 38.4 with ETC2.
-- **Normal maps** are JXL-SZI's weak spot: 35.6 dB against `.ctex`'s 48.0. Lower distances for normal maps are the
-  next thing to try.
-- **Not tried yet:** Basis with RDO (smaller files, lower quality) and JXL-SZI at lower distances.
+- **Normal maps** were JXL-SZI's weak spot at distance 1.0: 35.6 dB against `.ctex`'s 48.0 on 20 of them.
+- **Normal-map distances, all 45 maps** (files / BC5 quality): `.ctex` 91.2 MB / 44.0 dB, Basis 54.4 / 38.2;
+  JXL-SZI 1.0: 30.8 / 34.3, 0.7: 37.3 / 36.0, 0.5: 44.4 / 37.6, 0.35: 53.1 / 39.5, 0.25: 62.0 / 41.2, 0.15:
+  76.3 / 43.6, 0.05: 110.6 / 47.1. ETC2 / EAC is 0.3-0.6 dB above BC5 at each. Quality climbs ~1.7 dB per step
+  with no plateau, and 0.05 passes `.ctex`, so the GPU's BC5 encoder isn't the limit.
+- **Default since 0.2.0:** 0.35 for normal maps, the size of Basis's normal maps with better quality. The build
+  grows 269 -> 291 MB; on the 60-texture set normal maps went 35.6 -> 40.6 dB and the average 39.0 -> 40.7.
+- **Not tried yet:** Basis with RDO (smaller files, lower quality), and a lower distance for colour textures.

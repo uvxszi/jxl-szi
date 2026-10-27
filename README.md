@@ -9,7 +9,7 @@
 > platform you target, and keep a normal export to fall back on. Use it at your own risk.
 
 **JXL-SZI is a Godot 4 addon that ships your game's textures as JPEG XL (JXL) instead of Godot's `.ctex`, and
-decodes them on the GPU at runtime.** It roughly halves the size of an exported game, at the same frame rate and
+decodes them on the GPU at runtime.** It makes an exported game about 40% smaller, at the same frame rate and
 steady memory. It needs no engine changes, no GDExtension and no native code at runtime: the decoder is GDScript
 plus Vulkan / D3D12 compute shaders through Godot's `RenderingDevice`.
 
@@ -26,8 +26,8 @@ In short:
 
 ## What it does
 
-- **About half the size:** every texture Godot imports as *VRAM Compressed* goes into the export as JPEG XL
-  (visually lossless, distance 1.0) instead of BC / ETC2 blocks.
+- **About 40% smaller builds:** every texture Godot imports as *VRAM Compressed* goes into the export as JPEG XL
+  instead of BC / ETC2 blocks: distance 1.0 (visually lossless) for colour, 0.35 for normal maps.
 - **Decoded on the GPU at startup:** a background thread uses its own RenderingDevice and does the entropy
   decode, inverse transforms, mipmaps and block compression (BC1 / BC3 / BC5 on desktop GPUs, ETC2 / EAC on phones).
   The textures your main scene needs are done first.
@@ -42,16 +42,19 @@ exported with and without the `jxl-szi` feature:
 
 | | `.ctex` | JXL-SZI |
 |---|---|---|
-| Windows .exe | 470 MB | 257 MB |
-| Linux x86_64 | 446 MB | 233 MB |
-| Android .apk (debug-signed) | 396 MB | 180 MB |
+| Windows .exe | 470 MB | 291 MB |
+| Linux x86_64 | 446 MB | 256 MB |
+| Android .apk (debug-signed) | 396 MB | 204 MB |
 | FPS, D3D12 / Vulkan | 235.6 / 233.4 | 235.6 / 233.7 |
 | VRAM in play, D3D12 / Vulkan | 1516 / 1420 MB | 1555 / 1405 MB |
 | RAM in play, D3D12 / Vulkan | 2157 / 2609 MB | 2238 / 2579 MB |
 | Main menu drawn (warm cache / cold NVMe) | 1.61 / 1.97 s | 1.69 / 2.01 s |
 
-- **From a slow drive** (a USB SSD), the JPEG XL build reached the menu 0.2-0.4 s sooner, because it reads half as
-  many bytes.
+The sizes are 0.2.0's (normal maps at distance 0.35). The other rows were measured with 0.1.0 (normal maps at
+1.0); the textures decode the same way, so they shouldn't change much.
+
+- **From a slow drive** (a USB SSD), the JPEG XL build reached the menu 0.2-0.4 s sooner, because it reads fewer
+  bytes.
 - **The costs:**
   - A memory peak while the startup set decodes: up to +0.5 GB of VRAM and RAM for about 1.5 s. The decoder's device
     is freed after that.
@@ -64,33 +67,52 @@ exported with and without the `jxl-szi` feature:
 
 The same sample game, exported three ways from the same project: Godot's default VRAM Compressed textures (`.ctex`),
 Godot's **Basis Universal** import mode (its defaults: UASTC level 0, no RDO), and JXL-SZI. Windows, D3D12, one run
-each.
+each. JXL-SZI's size and quality are 0.2.0's (normal maps at 0.35); its loading, FPS and memory were measured with
+normal maps at 1.0.
 
 | | `.ctex` | Basis Universal | JXL-SZI |
 |---|---|---|---|
-| Windows .exe | 493 MB | 331 MB | **269 MB** |
+| Windows .exe | 493 MB | 331 MB | **291 MB** |
 | Main menu drawn (warm cache) | 1.72 s | 2.34-2.45 s | 1.75 s |
 | Trial map in | 2.07 s | 3.16-3.32 s | 2.11 s |
 | Longest frame at trial start | 486 ms | 845-1121 ms | 500 ms |
 | FPS / 1% low | 236.8 / 228.7 | 236.8 / 227.2 | 236.4 / 215.3 |
 | Peak VRAM / RAM (Windows' counters) | 1548 / 2176 MB | 1533 / 2181 MB | 1812 / 2419 MB |
-| Quality, average of 60 textures | 45.5 dB | **47.0 dB** | 39.0 dB (BC), 38.4 dB (ETC2) |
+| Quality, average of 60 textures | 45.5 dB | **47.0 dB** | 40.7 dB (BC), 40.2 dB (ETC2) |
 | - colour (11) | 46.6 dB | 55.1 dB | 41.5 dB |
 | - with alpha (29) | 43.4 dB | 48.4 dB | 40.4 dB |
-| - normal maps (20) | 48.0 dB | 40.5 dB | 35.6 dB |
+| - normal maps (20) | 48.0 dB | 40.5 dB | 40.6 dB |
 
 Quality is the PSNR of the full-size mip level against the source image: higher is closer. For textures with alpha
 it's the visible pixels' colour, and for normal maps the X and Y channels.
 
-- **Size:** JXL-SZI makes the smallest build: 19% smaller than Basis, 45% smaller than `.ctex`.
+- **Size:** JXL-SZI makes the smallest build: 12% smaller than Basis, 41% smaller than `.ctex`.
 - **Loading:** Basis is transcoded on the CPU while scenes load, so it reached the menu about 0.6 s later and froze
   about twice as long when the trial started. JXL-SZI decodes on the GPU in the background and loads like `.ctex`.
 - **Frame rate:** the same for all three. JXL-SZI's lower 1% low is within run-to-run noise.
 - **Memory:** in play it's about equal. JXL-SZI's peaks come from the startup decode, for about 1.5 s.
 - **Quality:** JXL-SZI's textures are the furthest from the source, because JPEG XL at distance 1.0 is lossy before
-  the block compression. That's "visually lossless" by JPEG XL's own measure, not by PSNR. Normal maps lose the
-  most; a lower distance for them is planned. Basis scores highest on colour because Godot transcodes it to BC7 on
-  desktops.
+  the block compression. That's "visually lossless" by JPEG XL's own measure, not by PSNR. Normal maps get a lower
+  distance (0.35), which puts them level with Basis here and ahead of it over all 45 of the game's normal maps.
+  Basis scores highest on colour because Godot transcodes it to BC7 on desktops.
+
+#### Normal maps: distance against size and quality
+
+All 45 normal maps of the sample game, decoded by JXL-SZI and compared with their sources (X and Y channels):
+
+| | Normal-map files | Quality (BC5) |
+|---|---|---|
+| `.ctex` (BC5) | 91.2 MB | 44.0 dB |
+| Basis Universal | 54.4 MB | 38.2 dB |
+| JXL-SZI, distance 1.0 | 30.8 MB | 34.3 dB |
+| JXL-SZI, distance 0.5 | 44.4 MB | 37.6 dB |
+| **JXL-SZI, distance 0.35 (default)** | **53.1 MB** | **39.5 dB** |
+| JXL-SZI, distance 0.25 | 62.0 MB | 41.2 dB |
+| JXL-SZI, distance 0.15 | 76.3 MB | 43.6 dB |
+| JXL-SZI, distance 0.05 | 110.6 MB | 47.1 dB |
+
+Set **Converter > Normal Map Distance** to trade one for the other. The phone format (ETC2 / EAC) scores about
+0.3-0.6 dB higher than BC5 at each distance.
 
 This is the only game benchmarked so far. Benchmarks of open-source Godot games built with and without JXL-SZI are
 planned.
@@ -151,7 +173,8 @@ The addon has three project settings and one editor setting, and all of them hav
 
 | Setting | Default | What it does |
 |---|---|---|
-| Converter > Distance | 1.0 | cjxl's `-d`. 1.0 is visually lossless; higher is smaller and blurrier. |
+| Converter > Distance | 1.0 | cjxl's `-d` for colour textures. 1.0 is visually lossless; higher is smaller and blurrier. |
+| Converter > Normal Map Distance | 0.35 | cjxl's `-d` for normal maps. Lower keeps more detail and makes bigger files: see [the table](#normal-maps-distance-against-size-and-quality). |
 | Boot > Paths | empty | Scenes, resources or folders whose textures decode from startup, in order, after the main scene's. |
 | Boot > Script | empty | A script with `static func jxl_boot_paths() -> Array`, for a boot set you work out in code. Each entry is a path, or an Array of paths that share a rank. |
 
@@ -250,7 +273,7 @@ GitHub's own "Source code" downloads also leave out `docs/`, `tools/` and `.gith
   other decoders.
 - **How is it different from Basis Universal / KTX2?** Basis ships its own intermediate format, which Godot
   transcodes into GPU blocks on the CPU at load. JXL-SZI ships standard JPEG XL and does the full image decode on
-  the GPU. In the sample game, JXL-SZI's build was 19% smaller and loaded about 0.6 s faster, while Basis kept more
+  the GPU. In the sample game, JXL-SZI's build was 12% smaller and loaded about 0.6 s faster, while Basis kept more
   detail. See [Compared with `.ctex` and Basis Universal](#compared-with-ctex-and-basis-universal).
 
 ## License
