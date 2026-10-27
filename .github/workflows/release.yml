@@ -62,4 +62,4 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           gh release create "$GITHUB_REF_NAME" "dist/jxl-szi-$VERSION.zip" \
-            --title "JXL-SZI $VERSION" --notes-file dist/notes.md --prerelease
+            --title "JXL-SZI $VERSION" --notes-file dist/notes.md

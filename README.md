@@ -195,7 +195,7 @@ The sources, docs and CI stay out.
 2. Add a `## <version>` section to `CHANGELOG.md`, and commit. That section becomes the release notes.
 3. Tag and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
 
-The **Release** workflow checks that the tag matches `plugin.cfg`, builds the zip and publishes it as a pre-release.
+The **Release** workflow checks that the tag matches `plugin.cfg`, builds the zip and publishes it as a release.
 To see the zip without publishing anything, run the workflow by hand from the Actions tab: the zip comes out as a
 workflow artifact.
 
