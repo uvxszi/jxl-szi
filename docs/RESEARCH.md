@@ -159,3 +159,18 @@ matter. The IDs match the ones in the code's comments.
 - **Mobile GPUs:** they often have 32 KB of shared memory or less, and Vulkan only guarantees 16 KB (F28). The alpha
   kernel already picks 16 or 8 slots from the limit; the HF kernel uses ~27 KB.
 - **Only Godot 4.7.2** has been tried.
+
+## Against Basis Universal (2026-10-26)
+
+The sample game exported from one project three ways, measured on Windows / D3D12, one run each (README has the
+table):
+- **Size:** `.ctex` 493 MB, Basis (Godot's defaults: UASTC level 0, no RDO) 331 MB, JXL-SZI 269 MB.
+- **Loading:** Basis transcodes on the CPU during scene loads. Its menu came 0.6-0.7 s later than `.ctex`, the trial
+  map 1.1-1.25 s later, and the trial-start freeze was 845-1121 ms against 486 ms. JXL-SZI was within 30-40 ms of
+  `.ctex`.
+- **FPS:** the same for all three, ~236.8 when focused.
+- **Quality, PSNR of the top mip against the source over 60 textures:** Basis 47.0 dB (Godot transcodes it to BC7
+  on desktops: colour 55.1), `.ctex` 45.5, JXL-SZI 39.0 with BC / 38.4 with ETC2.
+- **Normal maps** are JXL-SZI's weak spot: 35.6 dB against `.ctex`'s 48.0. Lower distances for normal maps are the
+  next thing to try.
+- **Not tried yet:** Basis with RDO (smaller files, lower quality) and JXL-SZI at lower distances.
