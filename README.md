@@ -210,6 +210,8 @@ Put these after `--` on the command line:
   - Lossless, Lossy, Basis Universal and VRAM Uncompressed textures.
   - HDR images.
   - Anything with a `.gdignore` on the way.
+  - `.jxl` files already in the project. Godot doesn't import them as textures, so the export never sees them; see
+    the FAQ.
 - **Differences from Godot's own import:**
   - Every converted texture gets mipmaps, even if its import turns them off.
   - "High quality" (BC7) imports become BC1 / BC3 like the rest.
@@ -271,6 +273,13 @@ GitHub's own "Source code" downloads also leave out `docs/`, `tools/` and `.gith
   4.7.2 can't copy into BC textures: the blocks are read back and uploaded instead.
 - **Can other tools open the files?** Yes. They are standard JPEG XL. The extra boxes JXL-SZI adds are ignored by
   other decoders.
+- **Can I use `.jxl` files I already have?** Not yet. JXL-SZI converts PNG, JPEG, WebP, TGA and BMP textures, and
+  leaves `.jxl` files in a project untouched. There are two reasons:
+  - Godot 4 has no JPEG XL importer, so a `.jxl` in a project isn't a texture scenes can use.
+  - The GPU decoder reads only the subset of JPEG XL its own converter writes, with the converter's extra boxes. A
+    `.jxl` made by another tool would need re-encoding first.
+
+  Importing existing `.jxl` files as textures may come in a later version.
 - **How is it different from Basis Universal / KTX2?** Basis ships its own intermediate format, which Godot
   transcodes into GPU blocks on the CPU at load. JXL-SZI ships standard JPEG XL and does the full image decode on
   the GPU. In the sample game, JXL-SZI's build was 12% smaller and loaded about 0.6 s faster, while Basis kept more
