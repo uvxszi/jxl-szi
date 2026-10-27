@@ -188,7 +188,7 @@ docs/                  how it works, and the research behind it
 
 ### Making a release
 
-A release zip holds only `addons/jxl_szi`, with the license and third-party notices inside it, plus this README.
+A release zip holds only `addons/jxl_szi`, with the license, the third-party notices and this README inside it.
 The sources, docs and CI stay out.
 
 1. Set `version` in `addons/jxl_szi/plugin.cfg`.

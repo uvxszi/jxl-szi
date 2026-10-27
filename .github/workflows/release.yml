@@ -1,5 +1,5 @@
 # Publishes a release with only what a Godot project needs: a zip holding addons/jxl_szi (with the license, the
-# third-party notices and their license texts inside it) and the README. Sources, docs and CI stay out.
+# third-party notices, their license texts and the README inside it). Sources, docs and CI stay out.
 #
 #   Release:  set `version` in addons/jxl_szi/plugin.cfg, add a "## <version>" section to CHANGELOG.md, commit, then
 #             git tag v<version> && git push origin v<version>
@@ -41,7 +41,7 @@ jobs:
           rm -rf "$pkg/addons/jxl_szi/data"
           cp LICENSE THIRD_PARTY_NOTICES.md "$pkg/addons/jxl_szi/"
           cp -r licenses "$pkg/addons/jxl_szi/"
-          cp README.md "$pkg/"
+          cp README.md "$pkg/addons/jxl_szi/" # not at the zip root: that would overwrite the project's own README
           (cd "$pkg" && zip -qr "../jxl-szi-$VERSION.zip" .)
           unzip -l "dist/jxl-szi-$VERSION.zip" | tail -1
           # the release notes: this version's CHANGELOG section
