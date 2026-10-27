@@ -1,0 +1,65 @@
+# Publishes a release with only what a Godot project needs: a zip holding addons/jxl_szi (with the license, the
+# third-party notices and their license texts inside it) and the README. Sources, docs and CI stay out.
+#
+#   Release:  set `version` in addons/jxl_szi/plugin.cfg, add a "## <version>" section to CHANGELOG.md, commit, then
+#             git tag v<version> && git push origin v<version>
+#   Dry run:  Actions > Release > Run workflow: builds the zip as a workflow artifact, publishes nothing.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the version
+        id: version
+        run: |
+          version=$(sed -n 's/^version="\(.*\)"$/\1/p' addons/jxl_szi/plugin.cfg)
+          [ -n "$version" ] || { echo "::error::no version in addons/jxl_szi/plugin.cfg"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match plugin.cfg version $version (expected v$version)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the zip
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          pkg=dist/jxl-szi
+          mkdir -p "$pkg/addons"
+          cp -r addons/jxl_szi "$pkg/addons/"
+          rm -rf "$pkg/addons/jxl_szi/data"
+          cp LICENSE THIRD_PARTY_NOTICES.md "$pkg/addons/jxl_szi/"
+          cp -r licenses "$pkg/addons/jxl_szi/"
+          cp README.md "$pkg/"
+          (cd "$pkg" && zip -qr "../jxl-szi-$VERSION.zip" .)
+          unzip -l "dist/jxl-szi-$VERSION.zip" | tail -1
+          # the release notes: this version's CHANGELOG section
+          awk -v v="$VERSION" '/^## /{on = index($0, "## " v) == 1; next} on' CHANGELOG.md > dist/notes.md
+          [ -s dist/notes.md ] || echo "JXL-SZI $VERSION" > dist/notes.md
+
+      - name: Upload the zip (dry run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jxl-szi-${{ steps.version.outputs.version }}
+          path: dist/jxl-szi-${{ steps.version.outputs.version }}.zip
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/jxl-szi-$VERSION.zip" \
+            --title "JXL-SZI $VERSION" --notes-file dist/notes.md --prerelease

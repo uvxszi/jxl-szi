@@ -81,7 +81,9 @@ How it got here, and what was measured on the way: [docs/RESEARCH.md](docs/RESEA
 
 ## Install
 
-1. **Copy the addon:** put the `addons/jxl_szi` folder into your project's `addons/` folder.
+1. **Copy the addon:** download `jxl-szi-<version>.zip` from
+   [Releases](https://github.com/uvxszi/jxl-szi/releases) and unzip it into your project's folder, so that you get
+   `addons/jxl_szi`. Or copy that folder from a clone of this repository.
 2. **Enable it:** in **Project > Project Settings > Plugins**, enable **JXL-SZI**. This adds the autoload `JxlSzi`
    and keeps it first in the autoload list, so it's ready before anything else loads a texture.
 3. **Add the export feature:** in **Project > Export**, pick the preset to ship as JPEG XL. On its **Features**
@@ -181,7 +183,24 @@ addons/jxl_szi/        the addon: copy this folder into a project
 tools/                 sources of the converter tools: the libjxl patch, the stager (Rust), BUILDING.md
 licenses/              licenses of everything compiled into the bundled tools
 docs/                  how it works, and the research behind it
+.github/workflows/     the release workflow
 ```
+
+### Making a release
+
+A release zip holds only `addons/jxl_szi`, with the license and third-party notices inside it, plus this README.
+The sources, docs and CI stay out.
+
+1. Set `version` in `addons/jxl_szi/plugin.cfg`.
+2. Add a `## <version>` section to `CHANGELOG.md`, and commit. That section becomes the release notes.
+3. Tag and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
+The **Release** workflow checks that the tag matches `plugin.cfg`, builds the zip and publishes it as a pre-release.
+To see the zip without publishing anything, run the workflow by hand from the Actions tab: the zip comes out as a
+workflow artifact.
+
+GitHub's own "Source code" downloads also leave out `docs/`, `tools/` and `.github/` (`export-ignore` in
+`.gitattributes`).
 
 ## FAQ
 
