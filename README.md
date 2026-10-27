@@ -35,109 +35,101 @@ In short:
   a texture is decoded it shows a 16x16 thumbnail of itself, then fills in where it is.
 - **Only where you ask:** export presets without the `jxl-szi` feature, and the editor, are untouched.
 
-### Measured in a sample game
+### Benchmarks
 
-A 3D game with 236 textures, mostly 1-2K character and prop maps. Windows 11, RTX 5070, release builds, the same game
-exported with and without the `jxl-szi` feature:
+All measured in one sample game: a 3D game with 236 textures, mostly 1-2K character and prop maps. Windows 11, RTX
+5070, D3D12, release builds exported from the same project.
 
-| | `.ctex` | JXL-SZI |
-|---|---|---|
-| Windows .exe | 470 MB | 291 MB |
-| Linux x86_64 | 446 MB | 256 MB |
-| Android .apk (debug-signed) | 396 MB | 204 MB |
-| FPS, D3D12 / Vulkan | 235.6 / 233.4 | 235.6 / 233.7 |
-| VRAM in play, D3D12 / Vulkan | 1516 / 1420 MB | 1555 / 1405 MB |
-| RAM in play, D3D12 / Vulkan | 2157 / 2609 MB | 2238 / 2579 MB |
-| Main menu drawn (warm cache / cold NVMe) | 1.61 / 1.97 s | 1.69 / 2.01 s |
+#### Every format, sorted by build size, then FPS, then quality
 
-The sizes are 0.2.0's (normal maps at distance 0.35). The other rows were measured with 0.1.0 (normal maps at
-1.0); the textures decode the same way, so they shouldn't change much.
+2560x1440 exclusive fullscreen, vsync off, no frame cap, Ultra, MSAA 4x. Each format ran twice, 10 s of a camera
+turning a full circle in the same solo trial; a range covers both runs. Quality is the PSNR of the full-size mip
+level against the source images, over the same 60 textures: higher is closer to the source.
 
-- **From a slow drive** (a USB SSD), the JPEG XL build reached the menu 0.2-0.4 s sooner, because it reads fewer
-  bytes.
-- **The costs:**
-  - A memory peak while the startup set decodes: up to +0.5 GB of VRAM and RAM for about 1.5 s. The decoder's device
-    is freed after that.
-  - Thumbnails show for a moment at startup.
-  - The textures are further from the source images than `.ctex` (see the comparison below).
-- **Compressed downloads gain less:** zipped, the build was only 11% smaller, because BC data compresses well and
-  JPEG XL doesn't.
+| Format | Build | FPS | 1% low | Quality | Video memory | RAM |
+|---|---|---|---|---|---|---|
+| JXL-SZI, BC7 everywhere, Balanced | **291 MB** | 313-326 | 207-209 | 45.0 dB | 1954 MB | 2564-2569 MB |
+| JXL-SZI, BC1 / BC3 / BC5 | **291 MB** | 315 | 203-206 | 41.2 dB | 1906 MB | 2517-2520 MB |
+| JXL-SZI, BC7 everywhere, Fast | **291 MB** | 312 | 204-206 | 43.9 dB | 1954-1970 MB | 2570-2580 MB |
+| **JXL-SZI, BC1 / BC7 / BC5, Balanced (default)** | **291 MB** | 309-311 | 199-202 | 43.4 dB | 1906 MB | 2525-2526 MB |
+| JXL-SZI, BC7 everywhere, Best | **291 MB** | 307-308 | 192-202 | 45.4 dB | 1954-1955 MB | 2576-2686 MB |
+| Godot Basis Universal (UASTC) | 331 MB | 310-315 | 198-202 | 47.0 dB | 1883-1899 MB | 2465-2494 MB |
+| Godot VRAM Compressed (`.ctex`) | 493 MB | 307-311 | 187-199 | 45.5 dB | **1835 MB** | **2414-2422 MB** |
+| Godot VRAM Compressed, High Quality | 554 MB | 315-330 | 196-199 | **47.6 dB** | 1883-1899 MB | 2478-2497 MB |
 
-### Compared with `.ctex` and Basis Universal
+- **Size:** every JXL-SZI setting ships the same 291 MB, because the game builds its blocks while it loads, from
+  the same JPEG XL files. That's 12% smaller than Basis and 41% smaller than `.ctex`.
+- **FPS:** the same for every format, 307-330. The same format moved by up to 13 FPS between its two runs, so the
+  order within a size is noise.
+- **Quality:** Godot's High Quality and Basis keep the most detail. JXL-SZI with BC7 everywhere is level with
+  `.ctex`; the default trades 2 dB of that for BC1's memory on opaque textures.
+- **Memory:** JXL-SZI uses about 70 MB more video memory and 100 MB more RAM than `.ctex` in play: its startup set
+  decodes some textures this trial never loads. BC7 everywhere adds about 50 MB more.
 
-The same sample game, exported three ways from the same project: Godot's default VRAM Compressed textures (`.ctex`),
-Godot's **Basis Universal** import mode (its defaults: UASTC level 0, no RDO), and JXL-SZI. Windows, D3D12, one run
-each. JXL-SZI's size and quality are 0.3.0's defaults (BC1 for opaque textures, BC7 for textures with alpha, normal
-maps at distance 0.35); its loading, FPS and memory were measured with 0.1.0 (normal maps at 1.0, BC3 for alpha).
+Quality by kind of texture, in the same order (colour: 11 opaque textures; alpha: the visible pixels' colour of 29
+textures with alpha; normal maps: the X and Y channels of 20):
 
-| | `.ctex` | Basis Universal | JXL-SZI |
+| Format | Colour | With alpha | Normal maps |
 |---|---|---|---|
-| Windows .exe | 493 MB | 331 MB | **291 MB** |
-| Main menu drawn (warm cache) | 1.72 s | 2.34-2.45 s | 1.75 s |
-| Trial map in | 2.07 s | 3.16-3.32 s | 2.11 s |
-| Longest frame at trial start | 486 ms | 845-1121 ms | 500 ms |
-| FPS / 1% low | 236.8 / 228.7 | 236.8 / 227.2 | 236.4 / 215.3 |
-| Peak VRAM / RAM (Windows' counters) | 1548 / 2176 MB | 1533 / 2181 MB | 1812 / 2419 MB |
-| Quality, average of 60 textures | 45.5 dB | **47.0 dB** | 43.4 dB (45.0 with BC7 for opaque too; ETC2: 40.2) |
-| - colour (11) | 46.6 dB | 55.1 dB | 41.7 dB (BC1), 50.6 dB (BC7) |
-| - with alpha (29) | 43.4 dB | 48.4 dB | 45.6 dB |
-| - normal maps (20) | 48.0 dB | 40.5 dB | 41.1 dB |
+| JXL-SZI, BC7 everywhere, Balanced | 50.6 dB | 45.6 dB | 41.1 dB |
+| JXL-SZI, BC1 / BC3 / BC5 | 41.7 dB | 41.0 dB | 41.1 dB |
+| JXL-SZI, BC7 everywhere, Fast | 50.5 dB | 43.3 dB | 41.1 dB |
+| **JXL-SZI, BC1 / BC7 / BC5, Balanced (default)** | 41.7 dB | 45.6 dB | 41.1 dB |
+| JXL-SZI, BC7 everywhere, Best | 50.8 dB | 46.3 dB | 41.1 dB |
+| Godot Basis Universal | 55.1 dB | 48.4 dB | 40.5 dB |
+| Godot VRAM Compressed (`.ctex`) | 46.6 dB | 43.4 dB | 48.0 dB |
+| Godot VRAM Compressed, High Quality | 53.6 dB | 48.5 dB | 43.2 dB |
 
-Quality is the PSNR of the full-size mip level against the source image: higher is closer. For textures with alpha
-it's the visible pixels' colour, and for normal maps the X and Y channels.
-
-- **Size:** JXL-SZI makes the smallest build: 12% smaller than Basis, 41% smaller than `.ctex`.
-- **Loading:** Basis is transcoded on the CPU while scenes load, so it reached the menu about 0.6 s later and froze
-  about twice as long when the trial started. JXL-SZI decodes on the GPU in the background and loads like `.ctex`.
-- **Frame rate:** the same for all three. JXL-SZI's lower 1% low is within run-to-run noise.
-- **Memory:** in play it's about equal. JXL-SZI's peaks come from the startup decode, for about 1.5 s.
-- **Quality:** decoded on its own, JPEG XL at distance 1.0 keeps colour at 52.9 dB against the source. Most of the
-  loss comes from the GPU block format afterwards: BC1 brings colour down to 41.7 dB, BC7 only to 50.6.
-  - **Textures with alpha** use BC7 by default: the same memory as BC3, and 45.6 dB instead of 41.0.
-  - **Opaque textures** stay on BC1 by default, which keeps Godot's own texture memory. Setting **Blocks > Opaque
-    Format** to BC7 brings the average to 45.0 dB, level with `.ctex`, for twice those textures' memory (+33 MB in
-    this game).
-  - **Normal maps** get a lower distance (0.35), which puts them level with Basis here and ahead of it over all 45 of
-    the game's normal maps.
-  - **Basis** scores highest on colour because Godot transcodes it to BC7 on desktops.
-
-#### Block formats: quality and cost
-
-The same 60 textures, decoded by JXL-SZI with each setting and compared with their sources. The decode time is the
-whole GPU decode of the 60 textures, on an RTX 5070.
-
-| Blocks setting | Colour (11) | With alpha (29) | Normal maps (20) | All 60 | Decode |
-|---|---|---|---|---|---|
-| The decoded image, before block compression | 52.9 dB | 48.6 dB | 42.5 dB | 47.3 dB | |
-| BC1 / BC3 / BC5 as in 0.2.0 | 41.5 dB | 40.4 dB | 40.6 dB | 40.7 dB | 315 ms |
-| BC1 / BC3 / BC5 with refinement and endpoint search | 41.7 dB | 41.0 dB | 41.1 dB | 41.2 dB | 323 ms |
-| **BC1, BC7 for alpha, Balanced (default)** | **41.7 dB** | **45.6 dB** | **41.1 dB** | **43.4 dB** | **348 ms** |
-| BC7 everywhere, Fast | 50.5 dB | 43.3 dB | 41.1 dB | 43.9 dB | 339 ms |
-| BC7 everywhere, Balanced | 50.6 dB | 45.6 dB | 41.1 dB | 45.0 dB | 417 ms |
-| BC7 everywhere, Best | 50.8 dB | 46.3 dB | 41.1 dB | 45.4 dB | 912 ms |
-| ETC2 / EAC (phones) | 40.3 dB | 39.3 dB | 41.3 dB | 40.2 dB | 476 ms |
-
+- **Where JXL-SZI's loss comes from:** decoded on its own, JPEG XL at distance 1.0 keeps colour at 52.9 dB. Most of
+  the loss is the GPU block format afterwards: BC1 brings it down to 41.7 dB, BC7 only to 50.6.
+- **Normal maps** are limited by JPEG XL itself (42.5 dB before BC5 at distance 0.35); see the distance table below.
+  Godot's `.ctex` keeps them best because it compresses the source straight to BC5. High Quality stores them as BC7
+  and Basis transcodes them from UASTC, which both lose more.
 - **The alpha channel itself** comes out a little less exact with BC7 than with BC3: 47.1 dB instead of 49.0. The
   colour of those textures gains far more.
-- **Build size:** the same for every Blocks setting (291 MB here): the game builds its blocks while it loads, from
-  the same JPEG XL files.
 
-In play, the same sample game on Windows / D3D12, a 30 s camera sweep per run, two runs each (ranges are both runs):
+#### Loading
 
-| | FPS | 1% low | GPU time per frame | Video memory | RAM | Build |
-|---|---|---|---|---|---|---|
-| `.ctex` (reference) | 236.8 | 229.8 | 1.94 ms | 1485 MB | 2125 MB | 493 MB |
-| BC1 / BC3 / BC5 (0.2.0's formats) | 236.7-237.0 | 230.0-230.8 | 1.94-1.95 ms | 1555 MB | 2207-2224 MB | 291 MB |
-| **BC1, BC7 for alpha (default)** | **235.9-236.6** | **207.6-224.5** | **2.02-2.15 ms** | **1555 MB** | **2216-2221 MB** | **291 MB** |
-| BC7 everywhere | 236.7-236.8 | 226.4-228.7 | 2.11-2.13 ms | 1603-1605 MB | 2264-2278 MB | 291 MB |
+1920x1080 windowed, warm file cache, one or two runs:
 
-- **Frame rate:** the same for all of them. The window can't show more than the 240 Hz screen's ~237 FPS.
-- **GPU time:** BC7 costs about 0.1-0.2 ms more GPU time per frame (5-10%) in this game, which only matters for a
-  GPU-bound game. The default's lower 1% low came from one run (the other was 224.5) and isn't a BC7 effect: the
-  BC7-everywhere runs kept theirs.
-- **Memory:** BC7 for alpha uses the same memory as BC3. BC7 everywhere adds about 50 MB of video memory and 50 MB of
-  RAM here. The JPEG XL builds use about 70 MB more video memory than `.ctex` in play: the startup set decodes a few
-  textures that this trial never loads.
+| Format | Main menu drawn | Trial map in | Longest frame at trial start |
+|---|---|---|---|
+| Godot VRAM Compressed (`.ctex`) | 1.72 s | 2.07 s | 486 ms |
+| JXL-SZI | 1.71-1.75 s | 2.11-2.18 s | 500 ms |
+| Godot Basis Universal | 2.34-2.45 s | 3.16-3.32 s | 845-1121 ms |
+
+- **Basis** is transcoded on the CPU while scenes load; JXL-SZI decodes on the GPU in the background.
+- **From a slow drive** (a USB SSD), JXL-SZI reached the menu 0.2-0.4 s sooner than `.ctex`, because it reads fewer
+  bytes.
+- **The first launch** compiles the decoder's shaders (a few hundred ms; about a second more with BC7). They're
+  cached for later launches.
+- **A memory peak** while the startup set decodes: up to +0.5 GB of video memory and RAM for about 1.5 s. The
+  decoder's device is freed after that.
+
+#### Decode time per Blocks setting
+
+The whole GPU decode of the same 60 textures:
+
+| Blocks setting | Quality | Decode |
+|---|---|---|
+| The decoded image, before block compression | 47.3 dB | |
+| BC1 / BC3 / BC5 as in 0.2.0 | 40.7 dB | 315 ms |
+| BC1 / BC3 / BC5 with refinement and endpoint search | 41.2 dB | 323 ms |
+| BC7 everywhere, Fast | 43.9 dB | 339 ms |
+| **BC1 / BC7 / BC5, Balanced (default)** | **43.4 dB** | **348 ms** |
+| BC7 everywhere, Balanced | 45.0 dB | 417 ms |
+| ETC2 / EAC (phones) | 40.2 dB | 476 ms |
+| BC7 everywhere, Best | 45.4 dB | 912 ms |
+
+#### Other platforms
+
+| Build | `.ctex` | JXL-SZI |
+|---|---|---|
+| Windows .exe | 493 MB | 291 MB |
+| Linux x86_64 | 446 MB | 256 MB |
+| Android .apk (debug-signed) | 396 MB | 204 MB |
+
+The Linux and Android `.ctex` builds were measured a day earlier, when the Windows one was 470 MB. Zipped, the Windows build was only 11% smaller, because BC data compresses well and JPEG XL doesn't.
 
 #### Normal maps: distance against size and quality
 
@@ -145,13 +137,13 @@ All 45 normal maps of the sample game, decoded by JXL-SZI and compared with thei
 
 | | Normal-map files | Quality (BC5) |
 |---|---|---|
-| `.ctex` (BC5) | 91.2 MB | 44.0 dB |
-| Basis Universal | 54.4 MB | 38.2 dB |
 | JXL-SZI, distance 1.0 | 30.8 MB | 34.3 dB |
 | JXL-SZI, distance 0.5 | 44.4 MB | 37.6 dB |
 | **JXL-SZI, distance 0.35 (default)** | **53.1 MB** | **39.5 dB** |
+| Godot Basis Universal | 54.4 MB | 38.2 dB |
 | JXL-SZI, distance 0.25 | 62.0 MB | 41.2 dB |
 | JXL-SZI, distance 0.15 | 76.3 MB | 43.6 dB |
+| Godot VRAM Compressed (`.ctex`, BC5) | 91.2 MB | 44.0 dB |
 | JXL-SZI, distance 0.05 | 110.6 MB | 47.1 dB |
 
 Set **Converter > Normal Map Distance** to trade one for the other. The phone format (ETC2 / EAC) scores about
@@ -224,7 +216,7 @@ needs no new conversion.
 | Converter > Parallel Jobs | 0 | Textures converted at once during an export. 0 is half the CPU's threads. |
 | Boot > Paths | empty | Scenes, resources or folders whose textures decode from startup, in order, after the main scene's. |
 | Boot > Boot Script | empty | A script with `static func jxl_boot_paths() -> Array`, for a boot set you work out in code. Each entry is a path, or an Array of paths that share a rank. |
-| Blocks > Opaque Format | BC1 | BC1, or BC7 for twice the memory and far more detail. See [the table](#block-formats-quality-and-cost). |
+| Blocks > Opaque Format | BC1 | BC1, or BC7 for twice the memory and far more detail. See [the table](#every-format-sorted-by-build-size-then-fps-then-quality). |
 | Blocks > Alpha Format | BC7 | BC7 or BC3: the same memory; BC7 keeps the colour much closer, BC3 the alpha channel a little. |
 | Blocks > Encoder Search | Balanced | How hard the BC7 encoder searches: Fast, Balanced or Best. |
 | Blocks > Refinement Passes | 1 | Least-squares fitting passes for BC1 and BC7 endpoints. |
@@ -333,7 +325,8 @@ GitHub's own "Source code" downloads also leave out `docs/`, `tools/` and `.gith
   JPEG XL as a shipping format for textures through an addon.
 - **Is the decoding done on the CPU?** No. Only small per-file setup data is unpacked on CPU threads. The entropy
   decoding, inverse DCTs, colour conversion, mipmaps and BC / ETC2 encoding run in compute shaders.
-- **Does it change the frame rate?** No. The GPU samples the same BC / ETC2 block formats as with `.ctex`.
+- **Does it change the frame rate?** No. The GPU samples the same block formats Godot's own imports use. In the
+  sample game every format ran at 307-330 FPS at 1440p with no frame cap.
 - **Should I use BC7 for opaque textures?** If you can spare the memory, yes: it's the biggest quality step there is
   (colour 41.7 -> 50.6 dB in the sample game) for twice those textures' video memory. Set Blocks > Opaque Format to
   BC7; no new conversion is needed, the game encodes its blocks when it loads.
@@ -350,8 +343,8 @@ GitHub's own "Source code" downloads also leave out `docs/`, `tools/` and `.gith
   Importing existing `.jxl` files as textures may come in a later version.
 - **How is it different from Basis Universal / KTX2?** Basis ships its own intermediate format, which Godot
   transcodes into GPU blocks on the CPU at load. JXL-SZI ships standard JPEG XL and does the full image decode on
-  the GPU. In the sample game, JXL-SZI's build was 12% smaller and loaded about 0.6 s faster, while Basis kept more
-  detail. See [Compared with `.ctex` and Basis Universal](#compared-with-ctex-and-basis-universal).
+  the GPU. In the sample game, JXL-SZI's build was 12% smaller and loaded about 0.6 s faster at the same FPS, while Basis
+  kept more detail. See [the benchmarks](#every-format-sorted-by-build-size-then-fps-then-quality).
 
 ## License
 

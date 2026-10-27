@@ -200,6 +200,13 @@ decode of the 60, RTX 5070, D3D12):
 - **Converter effort:** -e 5 / 6 make the set 5.3-5.6% smaller than -e 7 with the same colour and alpha quality, but
   normal maps lose 1.2-1.5 dB. -e 8 / 9 fail on some textures with the 3,5,8 pass layout (JxlEncoderProcessOutput
   failed); plain cjxl -e 8 works.
+- **Every format at 1440p (2026-10-27):** exclusive fullscreen 2560x1440, vsync off, no cap, Ultra, MSAA 4x, 2 x 10 s
+  each, round two in reverse order. FPS: JXL-SZI 307-326 for every Blocks setting, Basis 310-315, .ctex 307-311, .ctex
+  High Quality 315-330; the same build varied up to 13 FPS between rounds, so there's no FPS difference between
+  formats. GPU time per frame 2.63-2.79 ms for all. Process video memory in play: .ctex 1835, Basis and High Quality
+  1883-1899, JXL-SZI 1906 (BC1 opaque) / 1954-1970 (BC7 everywhere) MB. Builds: JXL-SZI 291, Basis 331, .ctex 493,
+  High Quality 554 MB. Godot's High Quality import scores 47.6 dB over the 60 textures (colour 53.6, alpha 48.5,
+  normal maps 43.2: it makes them BC7, below BC5's 48.0).
 - **Project settings named ".../script"** don't show in Project Settings: the dialog lists a section's settings by
   their last part, and "script" collides with every object's own script property.
 
