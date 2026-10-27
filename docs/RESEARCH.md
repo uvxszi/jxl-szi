@@ -193,6 +193,10 @@ decode of the 60, RTX 5070, D3D12):
   entries worked out when needed: the same memory as BC3 (1846 vs 1847 MB peak), the same output (+0.1-0.4 dB from
   the rewrite's slightly different fit).
 - **Memory of BC7 everywhere:** +58 MB of Godot's RD textures, +33 MB of process video memory, in the sample game.
+- **In play (2026-10-27, 2 x 30 s each, D3D12, 240 Hz window):** FPS 236-237 for .ctex, 0.2.0's formats, the BC7-alpha
+  default and BC7 everywhere (screen-capped). GPU time per frame 1.94-1.95 ms (BC1 / BC3) vs 2.02-2.15 (BC7 alpha)
+  and 2.11-2.13 (BC7 everywhere). Process video memory in play 1485 (.ctex), 1555 (BC3 or BC7 alpha), 1603-1605 (BC7
+  everywhere); RAM 2125 / 2207-2224 / 2216-2221 / 2264-2278 MB. The build is 291 MB for every Blocks setting.
 - **Converter effort:** -e 5 / 6 make the set 5.3-5.6% smaller than -e 7 with the same colour and alpha quality, but
   normal maps lose 1.2-1.5 dB. -e 8 / 9 fail on some textures with the 3,5,8 pass layout (JxlEncoderProcessOutput
   failed); plain cjxl -e 8 works.

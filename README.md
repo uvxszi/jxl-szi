@@ -119,9 +119,25 @@ whole GPU decode of the 60 textures, on an RTX 5070.
 
 - **The alpha channel itself** comes out a little less exact with BC7 than with BC3: 47.1 dB instead of 49.0. The
   colour of those textures gains far more.
-- **Memory:** BC7 and BC3 are the same size; BC7 is twice BC1's. In the sample game Windows measured the same video
-  memory and RAM with BC7 for alpha as with BC3, and +33 MB of video memory with BC7 for everything.
-- **Frame rate:** not measured for these settings yet.
+- **Build size:** the same for every Blocks setting (291 MB here): the game builds its blocks while it loads, from
+  the same JPEG XL files.
+
+In play, the same sample game on Windows / D3D12, a 30 s camera sweep per run, two runs each (ranges are both runs):
+
+| | FPS | 1% low | GPU time per frame | Video memory | RAM | Build |
+|---|---|---|---|---|---|---|
+| `.ctex` (reference) | 236.8 | 229.8 | 1.94 ms | 1485 MB | 2125 MB | 493 MB |
+| BC1 / BC3 / BC5 (0.2.0's formats) | 236.7-237.0 | 230.0-230.8 | 1.94-1.95 ms | 1555 MB | 2207-2224 MB | 291 MB |
+| **BC1, BC7 for alpha (default)** | **235.9-236.6** | **207.6-224.5** | **2.02-2.15 ms** | **1555 MB** | **2216-2221 MB** | **291 MB** |
+| BC7 everywhere | 236.7-236.8 | 226.4-228.7 | 2.11-2.13 ms | 1603-1605 MB | 2264-2278 MB | 291 MB |
+
+- **Frame rate:** the same for all of them. The window can't show more than the 240 Hz screen's ~237 FPS.
+- **GPU time:** BC7 costs about 0.1-0.2 ms more GPU time per frame (5-10%) in this game, which only matters for a
+  GPU-bound game. The default's lower 1% low came from one run (the other was 224.5) and isn't a BC7 effect: the
+  BC7-everywhere runs kept theirs.
+- **Memory:** BC7 for alpha uses the same memory as BC3. BC7 everywhere adds about 50 MB of video memory and 50 MB of
+  RAM here. The JPEG XL builds use about 70 MB more video memory than `.ctex` in play: the startup set decodes a few
+  textures that this trial never loads.
 
 #### Normal maps: distance against size and quality
 
