@@ -17,21 +17,25 @@ extends Node
 ##   it fills in where it is.
 ## - The local device, and every scratch buffer with it, goes after IDLE_FREE s with nothing to do: once the boot set
 ##   is in, the game runs with no more memory than the textures themselves.
-## - Formats: BC1 / BC3 / BC5 where the GPU samples BC (desktops), else ETC2 RGB8 / RGBA8 and EAC RG11 (phones).
-## Switches (after `--` on the command line): --jxl-off (thumbnails only), --jxl-log (a line per part),
+## - Formats: BC1 or BC7 / BC3 or BC7 / BC5 where the GPU samples BC (desktops), else ETC2 RGB8 / RGBA8 and EAC RG11
+##   (phones).
+## The settings are the project's (settings.gd: Project Settings > Jxl Szi > Blocks / Runtime). Switches (after `--`
+## on the command line) override them for a run: --jxl-off (thumbnails only), --jxl-log (a line per part),
 ## --jxl-part-mp=<n> (boot part size), --jxl-threads=<n> (staging threads), --jxl-etc (ETC2 even where BC works),
-## --jxl-detail (detail by distance: lower mips for what's far away, decoded again as it comes closer).
+## --jxl-opaque=bc1|bc7, --jxl-alpha=bc3|bc7, --jxl-bc7=0|1|2 (fast, balanced, best), --jxl-detail (detail by
+## distance: lower mips for what's far away, decoded again as it comes closer).
 
+const Settings := preload("res://addons/jxl_szi/settings.gd")
 ## Pixels per boot part: the scratch buffers hold one part (16 bytes a pixel), so phones take smaller ones.
-static var BOOT_PART := (int(_arg("--jxl-part-mp=", "2" if OS.has_feature("mobile") else "8")) << 20)
+static var BOOT_PART := (int(_arg("--jxl-part-mp=", str(Settings.value("jxl_szi/runtime/boot_part_megapixels_mobile" if OS.has_feature("mobile") else "jxl_szi/runtime/boot_part_megapixels")))) << 20)
 ## Detail that follows the camera: off by default. Each change is a decode on the worker's device, which keeps that
 ## device (and its memory) alive for as long as the camera moves, for a few MB of textures saved.
-static var DETAIL := "--jxl-detail" in OS.get_cmdline_user_args()
+static var DETAIL: bool = "--jxl-detail" in OS.get_cmdline_user_args() or bool(Settings.value("jxl_szi/runtime/detail_by_distance"))
 ## The final textures are made on the main thread (Godot keeps an upload buffer per thread that makes textures, as big
 ## as its largest upload ever: a worker making them kept ~0.4 GB more memory on D3D12), at most this many bytes a frame.
-static var UPLOAD_FRAME := 16 << 20
+static var UPLOAD_FRAME := maxi(1, int(Settings.value("jxl_szi/runtime/upload_megabytes_per_frame"))) << 20
 static var STREAM_PART := 8 << 20
-static var LOG := "--jxl-log" in OS.get_cmdline_user_args()
+static var LOG: bool = "--jxl-log" in OS.get_cmdline_user_args() or bool(Settings.value("jxl_szi/runtime/log"))
 static var OFF := "--jxl-off" in OS.get_cmdline_user_args()
 const DATA := "res://addons/jxl_szi/data/" # what the export adds (export_plugin.gd)
 const GPU := "res://addons/jxl_szi/runtime/gpu/"
@@ -44,7 +48,8 @@ const FULL := 22.0
 const HALF := 50.0
 const NEAR := 12.0 # closer than this, out of view counts as in view (it's right behind you)
 const KEEP := 8.0
-const IDLE_FREE := 1.0
+## Seconds with nothing to decode before the worker's device and scratch memory go.
+static var IDLE_FREE := float(Settings.value("jxl_szi/runtime/free_device_after_seconds"))
 
 
 static func _arg(prefix: String, default: String) -> String:
@@ -143,7 +148,12 @@ func _init() -> void:
 	_stage = load("res://addons/jxl_szi/runtime/jxl_stage.gd")
 	_blocks = load(GPU + "blocks.gd")
 	_decoder = load(GPU + "decoder.gd")
-	_stage.set("THREADS", clampi(int(_arg("--jxl-threads=", "3")), 1, 16))
+	_stage.set("THREADS", clampi(int(_arg("--jxl-threads=", str(Settings.value("jxl_szi/runtime/staging_threads")))), 1, 16))
+	_blocks.set("opaque_bc7", _arg("--jxl-opaque=", "bc7" if int(Settings.value("jxl_szi/blocks/opaque_format")) == 1 else "bc1") == "bc7")
+	_blocks.set("alpha_bc7", _arg("--jxl-alpha=", "bc7" if int(Settings.value("jxl_szi/blocks/alpha_format")) == 1 else "bc3") == "bc7")
+	_blocks.set("bc7_quality", clampi(int(_arg("--jxl-bc7=", str(Settings.value("jxl_szi/blocks/encoder_search")))), 0, 2))
+	_blocks.set("refine", clampi(int(Settings.value("jxl_szi/blocks/refinement_passes")), 0, 3))
+	_blocks.set("bc4_search", bool(Settings.value("jxl_szi/blocks/single_channel_search")))
 	if not _blocks.call("choose_formats", _rd):
 		push_error("JXL-SZI: this GPU samples neither BC nor ETC2 textures: thumbnails only")
 		OFF = true

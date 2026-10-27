@@ -160,6 +160,45 @@ matter. The IDs match the ones in the code's comments.
   kernel already picks 16 or 8 slots from the limit; the HF kernel uses ~27 KB.
 - **Only Godot 4.7.2** has been tried.
 
+## Block formats (2026-10-27)
+
+Measured with probe_jxl_formats on the 60-texture set (PSNR of the top mip against the source; decode = the whole GPU
+decode of the 60, RTX 5070, D3D12):
+
+| | colour | with alpha (alpha channel) | normal maps | all | decode |
+|---|---|---|---|---|---|
+| raw RGBA8, no block compression | 52.90 | 48.57 (79.63) | 42.47 | 47.33 | |
+| BC1 / BC3 / BC5, no refinement (0.2.0) | 41.54 | 40.42 (46.95) | 40.55 | 40.67 | 315 ms |
+| + 1 refinement pass, BC4 endpoint search | 41.69 | 40.99 (48.97) | 41.10 | 41.16 | 323 ms |
+| + 2 refinement passes | 41.69 | 41.04 (48.97) | 41.10 | 41.18 | |
+| BC1 + BC7 alpha, Balanced (0.3.0 default) | 41.69 | 45.60 (47.09) | 41.10 | 43.38 | 348 ms |
+| BC7 everywhere, Fast (mode 6) | 50.46 | 43.32 (41.81) | 41.10 | 43.89 | 339 ms |
+| BC7 everywhere, Balanced | 50.55 | 45.60 (47.09) | 41.10 | 45.01 | 417 ms |
+| BC7 everywhere, Best | 50.75 | 46.27 (47.20) | 41.10 | 45.37 | 912 ms |
+| ETC2 / EAC | 40.34 | 39.33 (49.29) | 41.30 | 40.17 | 476 ms |
+
+- **The loss was mostly BC1, not JPEG XL:** decoded on its own, distance 1.0 keeps colour at 52.9 dB. BC1 took it to
+  41.5; BC7 keeps 50.6. Normal maps are limited by JPEG XL itself (42.5 before BC5, 41.1 after).
+- **BC1 refinement was off** (`refine` was always 0): one least-squares pass gains a little, a second nothing.
+- **BC4 endpoint search** (nudged endpoints plus the 6-value mode with exact 0 and 1): alpha channel +2 dB, normal
+  maps +0.55 dB, ~3% of decode time.
+- **BC7 modes:** mode 6 alone already gets colour to 50.5 dB but is poor for alpha (41.8: one interpolation for
+  colour and alpha). Mode 5 (separate 8-bit alpha) and mode 4 (alpha with 3-bit indices) bring alpha textures to
+  45.6 / 47.1; mode 7 and more partitions (Best) add ~0.4 dB at 2-3x the time.
+- **BC7 tables:** the 2-subset partition table and its anchors were checked against Godot's own BC7 decoder
+  (Image.decompress) by packing a test block per partition: all 64 and their anchors matched.
+- **D3D12 again (as F38):** the first BC7 encoder passed arrays (16 texels, 16 indices, a 16-entry palette) between
+  functions; they spilled into per-thread memory and Windows showed +~500 MB of video memory and +~320 MB RAM for
+  the whole session, invisible to Godot's counters. Texels in shared memory, indices in bit fields and palette
+  entries worked out when needed: the same memory as BC3 (1846 vs 1847 MB peak), the same output (+0.1-0.4 dB from
+  the rewrite's slightly different fit).
+- **Memory of BC7 everywhere:** +58 MB of Godot's RD textures, +33 MB of process video memory, in the sample game.
+- **Converter effort:** -e 5 / 6 make the set 5.3-5.6% smaller than -e 7 with the same colour and alpha quality, but
+  normal maps lose 1.2-1.5 dB. -e 8 / 9 fail on some textures with the 3,5,8 pass layout (JxlEncoderProcessOutput
+  failed); plain cjxl -e 8 works.
+- **Project settings named ".../script"** don't show in Project Settings: the dialog lists a section's settings by
+  their last part, and "script" collides with every object's own script property.
+
 ## Against Basis Universal (2026-10-26)
 
 The sample game exported from one project three ways, measured on Windows / D3D12, one run each (README has the

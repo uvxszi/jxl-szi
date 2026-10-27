@@ -21,7 +21,7 @@ In short:
   which measures below Godot's own formats against the source images.
 - **How it works:** the export converts VRAM-compressed textures to JPEG XL with a patched libjxl. At runtime,
   compute shaders do the entropy decode (ANS), the VarDCT inverse transforms, the mipmaps and the block
-  compression to BC1 / BC3 / BC5 (desktop) or ETC2 / EAC (mobile).
+  compression to BC1 / BC3 / BC5 / BC7 (desktop) or ETC2 / EAC (mobile).
 - **Status:** experimental, MIT licensed.
 
 ## What it does
@@ -29,8 +29,8 @@ In short:
 - **About 40% smaller builds:** every texture Godot imports as *VRAM Compressed* goes into the export as JPEG XL
   instead of BC / ETC2 blocks: distance 1.0 (visually lossless) for colour, 0.35 for normal maps.
 - **Decoded on the GPU at startup:** a background thread uses its own RenderingDevice and does the entropy
-  decode, inverse transforms, mipmaps and block compression (BC1 / BC3 / BC5 on desktop GPUs, ETC2 / EAC on phones).
-  The textures your main scene needs are done first.
+  decode, inverse transforms, mipmaps and block compression (BC1, BC7 and BC5 by default on desktop GPUs, ETC2 / EAC
+  on phones). The textures your main scene needs are done first.
 - **Nothing to change in your scenes:** scenes, materials and scripts keep pointing at `res://.../texture.png`. Until
   a texture is decoded it shows a 16x16 thumbnail of itself, then fills in where it is.
 - **Only where you ask:** export presets without the `jxl-szi` feature, and the editor, are untouched.
@@ -67,8 +67,8 @@ The sizes are 0.2.0's (normal maps at distance 0.35). The other rows were measur
 
 The same sample game, exported three ways from the same project: Godot's default VRAM Compressed textures (`.ctex`),
 Godot's **Basis Universal** import mode (its defaults: UASTC level 0, no RDO), and JXL-SZI. Windows, D3D12, one run
-each. JXL-SZI's size and quality are 0.2.0's (normal maps at 0.35); its loading, FPS and memory were measured with
-normal maps at 1.0.
+each. JXL-SZI's size and quality are 0.3.0's defaults (BC1 for opaque textures, BC7 for textures with alpha, normal
+maps at distance 0.35); its loading, FPS and memory were measured with 0.1.0 (normal maps at 1.0, BC3 for alpha).
 
 | | `.ctex` | Basis Universal | JXL-SZI |
 |---|---|---|---|
@@ -78,10 +78,10 @@ normal maps at 1.0.
 | Longest frame at trial start | 486 ms | 845-1121 ms | 500 ms |
 | FPS / 1% low | 236.8 / 228.7 | 236.8 / 227.2 | 236.4 / 215.3 |
 | Peak VRAM / RAM (Windows' counters) | 1548 / 2176 MB | 1533 / 2181 MB | 1812 / 2419 MB |
-| Quality, average of 60 textures | 45.5 dB | **47.0 dB** | 40.7 dB (BC), 40.2 dB (ETC2) |
-| - colour (11) | 46.6 dB | 55.1 dB | 41.5 dB |
-| - with alpha (29) | 43.4 dB | 48.4 dB | 40.4 dB |
-| - normal maps (20) | 48.0 dB | 40.5 dB | 40.6 dB |
+| Quality, average of 60 textures | 45.5 dB | **47.0 dB** | 43.4 dB (45.0 with BC7 for opaque too; ETC2: 40.2) |
+| - colour (11) | 46.6 dB | 55.1 dB | 41.7 dB (BC1), 50.6 dB (BC7) |
+| - with alpha (29) | 43.4 dB | 48.4 dB | 45.6 dB |
+| - normal maps (20) | 48.0 dB | 40.5 dB | 41.1 dB |
 
 Quality is the PSNR of the full-size mip level against the source image: higher is closer. For textures with alpha
 it's the visible pixels' colour, and for normal maps the X and Y channels.
@@ -91,10 +91,37 @@ it's the visible pixels' colour, and for normal maps the X and Y channels.
   about twice as long when the trial started. JXL-SZI decodes on the GPU in the background and loads like `.ctex`.
 - **Frame rate:** the same for all three. JXL-SZI's lower 1% low is within run-to-run noise.
 - **Memory:** in play it's about equal. JXL-SZI's peaks come from the startup decode, for about 1.5 s.
-- **Quality:** JXL-SZI's textures are the furthest from the source, because JPEG XL at distance 1.0 is lossy before
-  the block compression. That's "visually lossless" by JPEG XL's own measure, not by PSNR. Normal maps get a lower
-  distance (0.35), which puts them level with Basis here and ahead of it over all 45 of the game's normal maps.
-  Basis scores highest on colour because Godot transcodes it to BC7 on desktops.
+- **Quality:** decoded on its own, JPEG XL at distance 1.0 keeps colour at 52.9 dB against the source. Most of the
+  loss comes from the GPU block format afterwards: BC1 brings colour down to 41.7 dB, BC7 only to 50.6.
+  - **Textures with alpha** use BC7 by default: the same memory as BC3, and 45.6 dB instead of 41.0.
+  - **Opaque textures** stay on BC1 by default, which keeps Godot's own texture memory. Setting **Blocks > Opaque
+    Format** to BC7 brings the average to 45.0 dB, level with `.ctex`, for twice those textures' memory (+33 MB in
+    this game).
+  - **Normal maps** get a lower distance (0.35), which puts them level with Basis here and ahead of it over all 45 of
+    the game's normal maps.
+  - **Basis** scores highest on colour because Godot transcodes it to BC7 on desktops.
+
+#### Block formats: quality and cost
+
+The same 60 textures, decoded by JXL-SZI with each setting and compared with their sources. The decode time is the
+whole GPU decode of the 60 textures, on an RTX 5070.
+
+| Blocks setting | Colour (11) | With alpha (29) | Normal maps (20) | All 60 | Decode |
+|---|---|---|---|---|---|
+| The decoded image, before block compression | 52.9 dB | 48.6 dB | 42.5 dB | 47.3 dB | |
+| BC1 / BC3 / BC5 as in 0.2.0 | 41.5 dB | 40.4 dB | 40.6 dB | 40.7 dB | 315 ms |
+| BC1 / BC3 / BC5 with refinement and endpoint search | 41.7 dB | 41.0 dB | 41.1 dB | 41.2 dB | 323 ms |
+| **BC1, BC7 for alpha, Balanced (default)** | **41.7 dB** | **45.6 dB** | **41.1 dB** | **43.4 dB** | **348 ms** |
+| BC7 everywhere, Fast | 50.5 dB | 43.3 dB | 41.1 dB | 43.9 dB | 339 ms |
+| BC7 everywhere, Balanced | 50.6 dB | 45.6 dB | 41.1 dB | 45.0 dB | 417 ms |
+| BC7 everywhere, Best | 50.8 dB | 46.3 dB | 41.1 dB | 45.4 dB | 912 ms |
+| ETC2 / EAC (phones) | 40.3 dB | 39.3 dB | 41.3 dB | 40.2 dB | 476 ms |
+
+- **The alpha channel itself** comes out a little less exact with BC7 than with BC3: 47.1 dB instead of 49.0. The
+  colour of those textures gains far more.
+- **Memory:** BC7 and BC3 are the same size; BC7 is twice BC1's. In the sample game Windows measured the same video
+  memory and RAM with BC7 for alpha as with BC3, and +33 MB of video memory with BC7 for everything.
+- **Frame rate:** not measured for these settings yet.
 
 #### Normal maps: distance against size and quality
 
@@ -167,16 +194,32 @@ The export also prints `JXL-SZI export: 236 textures as JPEG XL (...)`.
 
 ## Settings
 
-The addon has three project settings and one editor setting, and all of them have working defaults.
+Every setting has a working default, and each one's description is shown right above it in the dialog.
 
-**Project > Project Settings > General**, section **Jxl Szi** (shown once the plugin is enabled):
+**Project > Project Settings > General**, section **Jxl Szi** (shown once the plugin is enabled). The Converter and
+Boot settings apply at export; Blocks and Runtime are read by the exported game when it starts, so changing them
+needs no new conversion.
 
 | Setting | Default | What it does |
 |---|---|---|
-| Converter > Distance | 1.0 | cjxl's `-d` for colour textures. 1.0 is visually lossless; higher is smaller and blurrier. |
-| Converter > Normal Map Distance | 0.35 | cjxl's `-d` for normal maps. Lower keeps more detail and makes bigger files: see [the table](#normal-maps-distance-against-size-and-quality). |
+| Converter > Distance | 1.0 | How much detail cjxl may drop from colour textures (`-d`). 1.0 is visually lossless; lower is bigger and closer to the source, higher smaller and blurrier. |
+| Converter > Normal Map Distance | 0.35 | The same for normal maps: see [the table](#normal-maps-distance-against-size-and-quality). |
+| Converter > Effort | 7 | cjxl's `-e`. 5 and 6 make files about 5% smaller with the same colour quality, but normal maps lose about 1.5 dB. Above 7 can fail with the pass layout the decoder needs. |
+| Converter > Parallel Jobs | 0 | Textures converted at once during an export. 0 is half the CPU's threads. |
 | Boot > Paths | empty | Scenes, resources or folders whose textures decode from startup, in order, after the main scene's. |
-| Boot > Script | empty | A script with `static func jxl_boot_paths() -> Array`, for a boot set you work out in code. Each entry is a path, or an Array of paths that share a rank. |
+| Boot > Boot Script | empty | A script with `static func jxl_boot_paths() -> Array`, for a boot set you work out in code. Each entry is a path, or an Array of paths that share a rank. |
+| Blocks > Opaque Format | BC1 | BC1, or BC7 for twice the memory and far more detail. See [the table](#block-formats-quality-and-cost). |
+| Blocks > Alpha Format | BC7 | BC7 or BC3: the same memory; BC7 keeps the colour much closer, BC3 the alpha channel a little. |
+| Blocks > Encoder Search | Balanced | How hard the BC7 encoder searches: Fast, Balanced or Best. |
+| Blocks > Refinement Passes | 1 | Least-squares fitting passes for BC1 and BC7 endpoints. |
+| Blocks > Single Channel Search | on | Better endpoints for BC3's alpha and BC5's normal maps. |
+| Runtime > Boot Part Megapixels | 8 | Megapixels per startup batch on desktops (the decoder's scratch memory is ~16 bytes a pixel of a batch). |
+| Runtime > Boot Part Megapixels Mobile | 2 | The same on phones and tablets. |
+| Runtime > Staging Threads | 3 | CPU threads that unpack each file's data for the GPU. |
+| Runtime > Upload Megabytes per Frame | 16 | At most this much of finished textures is made per frame. |
+| Runtime > Free Device After Seconds | 1.0 | Idle time before the decoder's GPU device and scratch memory are freed. |
+| Runtime > Detail by Distance | off | Lower mip levels for far-away objects. Saves a little texture memory, but keeps the decoder busy. |
+| Runtime > Log | off | A line per decoded batch, like `--jxl-log`. |
 
 Textures outside the boot set decode the moment something loads them, and show their thumbnail until then.
 
@@ -185,6 +228,9 @@ Textures outside the boot set decode the moment something loads them, and show t
 | Setting | Default | What it does |
 |---|---|---|
 | Custom Tools Dir | empty | Leave this empty. It's only for your own builds of the converter tools: a folder holding `cjxl` and `stager`. Empty uses the bundled ones in `addons/jxl_szi/bin/<os>-<arch>`. If the folder doesn't hold both tools, the export warns and uses the bundled ones. |
+
+**Upgrading from 0.2.0:** Boot > Script is now Boot > Boot Script (a setting named "script" is hidden in Project
+Settings). The plugin moves the old value over the first time the editor opens the project.
 
 ### Switches for the exported game
 
@@ -197,6 +243,9 @@ Put these after `--` on the command line:
 | `--jxl-part-mp=<n>` | Megapixels per startup batch (default 8, 2 on phones). |
 | `--jxl-threads=<n>` | CPU threads for staging (default 3). |
 | `--jxl-etc` | Uses ETC2 even where BC works. |
+| `--jxl-opaque=bc1\|bc7` | Overrides Blocks > Opaque Format for this run. |
+| `--jxl-alpha=bc3\|bc7` | Overrides Blocks > Alpha Format for this run. |
+| `--jxl-bc7=0\|1\|2` | Overrides Blocks > Encoder Search (Fast, Balanced, Best) for this run. |
 | `--jxl-detail` | Lower mip levels for far-away objects (off by default). |
 
 ## What it converts, and what it doesn't
@@ -214,7 +263,7 @@ Put these after `--` on the command line:
     the FAQ.
 - **Differences from Godot's own import:**
   - Every converted texture gets mipmaps, even if its import turns them off.
-  - "High quality" (BC7) imports become BC1 / BC3 like the rest.
+  - "High quality" (BC7) imports follow the Blocks settings like every other texture.
   - Godot's roughness-from-normal-map option isn't applied.
 - **In code:** scripts see a `Texture2DRD` where they used to see a `CompressedTexture2D`.
 
@@ -269,6 +318,9 @@ GitHub's own "Source code" downloads also leave out `docs/`, `tools/` and `.gith
 - **Is the decoding done on the CPU?** No. Only small per-file setup data is unpacked on CPU threads. The entropy
   decoding, inverse DCTs, colour conversion, mipmaps and BC / ETC2 encoding run in compute shaders.
 - **Does it change the frame rate?** No. The GPU samples the same BC / ETC2 block formats as with `.ctex`.
+- **Should I use BC7 for opaque textures?** If you can spare the memory, yes: it's the biggest quality step there is
+  (colour 41.7 -> 50.6 dB in the sample game) for twice those textures' video memory. Set Blocks > Opaque Format to
+  BC7; no new conversion is needed, the game encodes its blocks when it loads.
 - **Does it need a custom engine build?** No. It works on stock Godot 4.7.2, including the D3D12 driver, where Godot
   4.7.2 can't copy into BC textures: the blocks are read back and uploaded instead.
 - **Can other tools open the files?** Yes. They are standard JPEG XL. The extra boxes JXL-SZI adds are ignored by

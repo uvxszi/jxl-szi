@@ -45,7 +45,10 @@ This runs only for presets with the custom feature `jxl-szi`.
          own workgroup.
        - `vd8` / `vdl2`: inverse transforms for 8x8 and larger blocks, then XYB to RGBA8.
        - `mip_buf`: the mip chain.
-       - `blocks`: BC1 / BC3 / BC5 blocks, or ETC2 RGB8 / RGBA8 and EAC RG11 where the GPU can't sample BC.
+       - `blocks`: BC1 or BC7 (opaque), BC7 or BC3 (alpha) and BC5 (normal maps) by the Blocks settings, or ETC2
+         RGB8 / RGBA8 and EAC RG11 where the GPU can't sample BC. The BC7 encoder keeps its texels in shared memory
+         and its indices in bit fields: per-thread arrays spill into per-thread memory, which D3D12 keeps reserved
+         for every thread slot of the GPU (~0.5 GB in the first version).
      - Read the blocks back.
    - After a second with nothing to do, the device and every scratch buffer are freed.
 3. **The main thread:**

@@ -18,14 +18,11 @@ const RUNTIME := "res://addons/jxl_szi/runtime/"
 const BIN := "res://addons/jxl_szi/bin/"
 const CACHE := "res://.jxl_cache"
 const CACHE_VERSION := 2 # part of every cache key: bump when the converter's output changes
+const Settings := preload("settings.gd") # every setting, its default and what it does
 ## Editor Settings: a folder with your own builds of cjxl and stager. Empty (the usual): the bundled bin/<platform>.
 const TOOLS_SETTING := "jxl_szi/converter/custom_tools_dir"
-const DISTANCE_SETTING := "jxl_szi/converter/distance" # Project Settings: cjxl's -d (1.0 = visually lossless)
-## Project Settings: cjxl's -d for normal maps. Lighting shows their errors more, and at 0.35 they keep more detail
-## than Basis Universal at the same size (docs/RESEARCH.md).
-const NORMAL_DISTANCE_SETTING := "jxl_szi/converter/normal_map_distance"
 const BOOT_PATHS := "jxl_szi/boot/paths"
-const BOOT_SCRIPT := "jxl_szi/boot/script"
+const BOOT_SCRIPT := "jxl_szi/boot/boot_script"
 const IMAGES := ["png", "jpg", "jpeg", "webp", "tga", "bmp"]
 const SCENES := ["tscn", "scn", "tres", "res", "glb", "gltf", "fbx", "blend", "obj", "dae"]
 
@@ -48,16 +45,20 @@ func _export_begin(features: PackedStringArray, _is_debug: bool, _path: String, 
 		return
 	var texs := _vram_textures()
 	DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(CACHE))
-	var distance := float(ProjectSettings.get_setting(DISTANCE_SETTING, 1.0))
-	var normal_distance := float(ProjectSettings.get_setting(NORMAL_DISTANCE_SETTING, 0.35))
+	var distance := float(Settings.value("jxl_szi/converter/distance"))
+	var normal_distance := float(Settings.value("jxl_szi/converter/normal_map_distance"))
+	var effort := clampi(int(Settings.value("jxl_szi/converter/effort")), 1, 7)
 	var todo := []
 	for t: Dictionary in texs:
 		t.distance = normal_distance if t.normal else distance
+		t.effort = effort
 		var key := "%s|%s|%d" % [FileAccess.get_md5(t.path), t.normal, CACHE_VERSION]
 		if t.process != "":
 			key += "|" + t.process
 		if not is_equal_approx(t.distance, 1.0):
 			key += "|d%s" % t.distance
+		if effort != 7:
+			key += "|e%d" % effort
 		t.file = "%s_%s.jxl" % [String(t.path).get_file().get_basename(), key.md5_text().left(8)]
 		t.cached = "%s/%s" % [CACHE, t.file]
 		if not FileAccess.file_exists(t.cached):
@@ -205,13 +206,15 @@ func _convert(todo: Array) -> void:
 			src = tmp.path_join("src").path_join(String(t.file).get_basename() + ".png")
 			img.save_png(src)
 		t.enc = tmp.path_join("enc").path_join(t.file)
-		cmds.append([cjxl, [src, t.enc, "--quiet", "-d", str(t.distance), "-e", "7", "--faster_decoding=4", "--num_threads=2"]])
+		cmds.append([cjxl, [src, t.enc, "--quiet", "-d", str(t.distance), "-e", str(t.effort), "--faster_decoding=4", "--num_threads=2"]])
 	var env := { JXL_SZI_PASSES = "3,5,8", JXL_SZI_ANS = "1", JXL_SZI_SIDE = "z" }
 	var old := {}
 	for k: String in env:
 		old[k] = OS.get_environment(k)
 		OS.set_environment(k, env[k])
-	var jobs := maxi(1, OS.get_processor_count() / 2)
+	var jobs := int(Settings.value("jxl_szi/converter/parallel_jobs"))
+	if jobs <= 0:
+		jobs = maxi(1, OS.get_processor_count() / 2)
 	_run_all(cmds, jobs)
 	var encoded := []
 	for t: Dictionary in todo:

@@ -3,13 +3,16 @@ extends EditorPlugin
 ## JXL-SZI: ship your VRAM textures as JPEG XL, decoded on the GPU at runtime. Enabling the plugin adds the JxlSzi
 ## autoload (kept first, so it hands out textures before anything else loads one) and the export (export_plugin.gd),
 ## which only acts on presets with the custom feature `jxl-szi`.
-## Settings: Project Settings > General > Jxl Szi (converter distances, boot paths and script); Editor Settings > Jxl
-## Szi > Converter > Custom Tools Dir (Advanced Settings on; only for your own builds of the tools).
+## Settings (settings.gd, each shown with its description by help_inspector.gd): Project Settings > General > Jxl Szi
+## (converter, boot set, block formats, runtime); Editor Settings > Jxl Szi > Converter > Custom Tools Dir (Advanced
+## Settings on; only for your own builds of the tools).
 
 const AUTOLOAD := "JxlSzi"
 const AUTOLOAD_PATH := "res://addons/jxl_szi/runtime/jxl_stream.gd"
+const Settings := preload("settings.gd")
 
 var export_plugin: EditorExportPlugin
+var help: EditorInspectorPlugin
 
 
 func _enable_plugin() -> void:
@@ -24,6 +27,8 @@ func _disable_plugin() -> void:
 func _enter_tree() -> void:
 	export_plugin = preload("res://addons/jxl_szi/export_plugin.gd").new()
 	add_export_plugin(export_plugin)
+	help = preload("res://addons/jxl_szi/help_inspector.gd").new()
+	add_inspector_plugin(help)
 	_settings()
 	if ProjectSettings.has_setting("autoload/" + AUTOLOAD):
 		_autoload_first()
@@ -33,22 +38,29 @@ func _exit_tree() -> void:
 	if export_plugin:
 		remove_export_plugin(export_plugin)
 		export_plugin = null
+	if help:
+		remove_inspector_plugin(help)
+		help = null
 
 
-## The settings, registered so they show in the dialogs (with their defaults; a default isn't written to the file).
-## The project settings show without Advanced Settings; the editor one (rarely needed) only with it.
+## The settings (settings.gd), registered so they show in the dialogs (with their defaults; a default isn't written to
+## the file). The project settings show without Advanced Settings; the editor one (rarely needed) only with it.
 func _settings() -> void:
+	for old: String in Settings.RENAMED:
+		var new: String = Settings.RENAMED[old]
+		if ProjectSettings.has_setting(old):
+			if not ProjectSettings.has_setting(new) or str(ProjectSettings.get_setting(new)) == "":
+				ProjectSettings.set_setting(new, ProjectSettings.get_setting(old))
+			ProjectSettings.set_setting(old, null)
+			ProjectSettings.save()
 	var es := EditorInterface.get_editor_settings()
-	var tools: String = export_plugin.TOOLS_SETTING
-	if not es.has_setting(tools):
-		es.set_setting(tools, "")
-	es.set_initial_value(tools, "", false)
-	es.add_property_info({ name = tools, type = TYPE_STRING, hint = PROPERTY_HINT_GLOBAL_DIR })
-	_project_setting(export_plugin.DISTANCE_SETTING, 1.0, { type = TYPE_FLOAT, hint = PROPERTY_HINT_RANGE, hint_string = "0.05,5.0,0.05" })
-	_project_setting(export_plugin.NORMAL_DISTANCE_SETTING, 0.35, { type = TYPE_FLOAT, hint = PROPERTY_HINT_RANGE, hint_string = "0.05,5.0,0.05" })
-	_project_setting(export_plugin.BOOT_PATHS, PackedStringArray(), { type = TYPE_PACKED_STRING_ARRAY,
-		hint = PROPERTY_HINT_TYPE_STRING, hint_string = "%d/%d:" % [TYPE_STRING, PROPERTY_HINT_FILE] })
-	_project_setting(export_plugin.BOOT_SCRIPT, "", { type = TYPE_STRING, hint = PROPERTY_HINT_FILE, hint_string = "*.gd" })
+	for st: Dictionary in Settings.EDITOR:
+		if not es.has_setting(st.name):
+			es.set_setting(st.name, st.default)
+		es.set_initial_value(st.name, st.default, false)
+		es.add_property_info({ name = st.name, type = st.type, hint = st.get("hint", PROPERTY_HINT_NONE), hint_string = st.get("hint_string", "") })
+	for st: Dictionary in Settings.PROJECT:
+		_project_setting(st.name, st.default, { type = st.type, hint = st.get("hint", PROPERTY_HINT_NONE), hint_string = st.get("hint_string", "") })
 
 
 func _project_setting(name: String, value: Variant, info: Dictionary) -> void:

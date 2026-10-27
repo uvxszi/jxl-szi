@@ -1,8 +1,9 @@
 // JXL-SZI: block-compress every texture's mip levels at once, from the RGBA8 buffers (level 0 from vd8 / vdl2, the
 // rest from mip_buf) into one buffer, each mip chain in its final layout. Dispatch per mip level: z = texture,
 // xy = 4x4 block.
-// Default: BC1 (colour), BC3 (BC4 alpha + BC1), BC5 (two BC4 channels). With ETC (GPUs without BC, phones): ETC2 RGB8,
-// ETC2 RGBA8 (EAC alpha + ETC2) and EAC RG11, the same block sizes.
+// Default: BC1 (colour), BC3 (BC4 alpha + BC1), BC5 (two BC4 channels); with BC7 also BC7 for opaque colour (mode 3)
+// and colour + alpha (mode 4). With ETC (GPUs without BC, phones): ETC2 RGB8, ETC2 RGBA8 (EAC alpha + ETC2) and EAC
+// RG11, the same block sizes.
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -10,15 +11,18 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, std430) restrict readonly buffer Rgba { uint rgba[]; };
 layout(set = 0, binding = 1, std430) restrict readonly buffer Mips { uint mips[]; };
 // per texture and level (16 levels a texture, 12 words each): this level's buffer (0 rgba, 1 mips), offset, w, h,
-// mode (0 colour, 1 colour + alpha, 2 normal map), sRGB, this level's word offset in the output, 0, the previous
+// mode (0 colour, 1 colour + alpha, 2 normal map, 3 BC7 colour, 4 BC7 colour + alpha, 5 raw RGBA8 rows, for checks),
+// sRGB, this level's word
+// offset in the output, 0, the previous
 // level's buffer, offset, w, h
 layout(set = 0, binding = 2, std430) restrict readonly buffer Levels { uint lv[]; };
 layout(set = 0, binding = 3, std430) restrict writeonly buffer BlocksOut { uint bout[]; };
 
 layout(push_constant, std430) uniform Params {
 	uint level;
-	int refine;
-	uint pad0, pad1;
+	int refine; // least-squares passes after the first fit (BC1, BC7)
+	uint quality; // BC7: 0 mode 6 only, 1 + modes 1 / 5, 2 + more partitions and mode 3
+	uint flags; // 1: search BC4 endpoints (and its 6-value mode) instead of taking the range
 } params;
 
 #ifndef ETC
@@ -139,27 +143,42 @@ uvec2 encode_bc1(vec3 c[16], int refine) {
 	return best_block;
 }
 
-// --- BC4 single-channel block (8-value mode: a0 > a1) -------------------------------------------------------------
+// --- BC4 single-channel block --------------------------------------------------------------------------------------
 
-uvec2 encode_bc4(float v[16]) {
-	float mn = 1.0;
-	float mx = 0.0;
-	for (int i = 0; i < 16; i++) {
-		mn = min(mn, v[i]);
-		mx = max(mx, v[i]);
-	}
-	uint a0 = uint(round(mx * 255.0));
-	uint a1 = uint(round(mn * 255.0));
-	if (a0 == a1) {
-		return uvec2(a0 | (a1 << 8), 0u); // every texel index 0 = a0
+// One candidate: endpoints a0, a1 (a0 > a1: 8 values between them; else 6 values plus exact 0 and 255); returns its
+// squared error (in 0..255 units) and the block.
+float bc4_try(float v[16], uint a0, uint a1, out uvec2 blk) {
+	float pal[8];
+	float f0 = float(a0);
+	float f1 = float(a1);
+	pal[0] = f0;
+	pal[1] = f1;
+	if (a0 > a1) {
+		for (int k = 1; k <= 6; k++) {
+			pal[k + 1] = (float(7 - k) * f0 + float(k) * f1) / 7.0;
+		}
+	} else {
+		for (int k = 1; k <= 4; k++) {
+			pal[k + 1] = (float(5 - k) * f0 + float(k) * f1) / 5.0;
+		}
+		pal[6] = 0.0;
+		pal[7] = 255.0;
 	}
 	uint w0 = a0 | (a1 << 8);
 	uint w1 = 0u;
-	float span = float(a0) - float(a1);
+	float err = 0.0;
 	for (int i = 0; i < 16; i++) {
-		float t = (v[i] * 255.0 - float(a1)) / span * 7.0; // 0 = a1 ... 7 = a0
-		uint k = uint(clamp(round(t), 0.0, 7.0));
-		uint code = k == 7u ? 0u : (k == 0u ? 1u : 8u - k);
+		float x = v[i] * 255.0;
+		float bd = 1e30;
+		uint code = 0u;
+		for (uint k = 0u; k < 8u; k++) {
+			float d = (x - pal[k]) * (x - pal[k]);
+			if (d < bd) {
+				bd = d;
+				code = k;
+			}
+		}
+		err += bd;
 		uint bit = 16u + 3u * uint(i);
 		if (bit + 3u <= 32u) {
 			w0 |= code << bit;
@@ -170,7 +189,70 @@ uvec2 encode_bc4(float v[16]) {
 			w1 |= code >> (32u - bit);
 		}
 	}
-	return uvec2(w0, w1);
+	blk = uvec2(w0, w1);
+	return err;
+}
+
+// The values' range as endpoints; with `search` also nudged endpoints and the 6-value mode (whose exact 0 and 255
+// suit alpha), the lowest error wins.
+uvec2 encode_bc4(float v[16], bool search) {
+	float mn = 1.0;
+	float mx = 0.0;
+	for (int i = 0; i < 16; i++) {
+		mn = min(mn, v[i]);
+		mx = max(mx, v[i]);
+	}
+	uint hi = uint(round(mx * 255.0));
+	uint lo = uint(round(mn * 255.0));
+	uvec2 best;
+	float be = bc4_try(v, hi, lo, best);
+	if (!search || be == 0.0) {
+		return best;
+	}
+	for (int d0 = -2; d0 <= 2; d0++) {
+		for (int d1 = -2; d1 <= 2; d1++) {
+			int a0 = clamp(int(hi) + d0, 0, 255);
+			int a1 = clamp(int(lo) + d1, 0, 255);
+			if (a0 <= a1 || (d0 == 0 && d1 == 0)) {
+				continue;
+			}
+			uvec2 b;
+			float e = bc4_try(v, uint(a0), uint(a1), b);
+			if (e < be) {
+				be = e;
+				best = b;
+			}
+		}
+	}
+	float mn6 = 255.0;
+	float mx6 = 0.0;
+	bool any = false;
+	for (int i = 0; i < 16; i++) {
+		float x = v[i] * 255.0;
+		if (x > 0.5 && x < 254.5) {
+			mn6 = min(mn6, x);
+			mx6 = max(mx6, x);
+			any = true;
+		}
+	}
+	if (any) {
+		for (int d0 = -1; d0 <= 1; d0++) {
+			for (int d1 = -1; d1 <= 1; d1++) {
+				int a0 = clamp(int(round(mn6)) + d0, 0, 255);
+				int a1 = clamp(int(round(mx6)) + d1, 0, 255);
+				if (a0 > a1) {
+					continue;
+				}
+				uvec2 b;
+				float e = bc4_try(v, uint(a0), uint(a1), b);
+				if (e < be) {
+					be = e;
+					best = b;
+				}
+			}
+		}
+	}
+	return best;
 }
 
 #else
@@ -382,6 +464,617 @@ uvec2 encode_eac(float v[16], bool r11) {
 
 #endif
 
+#ifdef BC7
+
+// --- BC7 ---------------------------------------------------------------------------------------------------------
+// Opaque colour: mode 6 (one subset, 4-bit indices), plus mode 1 (two subsets, 3-bit) on the likeliest partitions and
+// mode 3 (two subsets, 2-bit, finer endpoints) at quality 2. With alpha: mode 6, plus modes 5 and 4 (colour and alpha
+// indexed apart; 4 gives alpha 3-bit indices) from quality 1 and mode 7 (two subsets with alpha) at 2. Texels in
+// 0..255; the lowest squared error wins. `params.quality`: 0 mode 6 only, 1 adds mode 1 on 2 partitions / modes 5
+// and 4, 2 mode 1 on 8 partitions, mode 3 on 4 / mode 4 both ways round, mode 7 on 4.
+// No per-thread arrays: the texels sit in shared memory, indices in bit fields, palette entries are worked out when
+// needed. (Arrays spill into per-thread memory, which D3D12 reserves for every thread slot of the GPU for as long as
+// the device lives: the first version of this encoder kept ~0.5 GB of video memory that way.)
+
+const int BC7_W2[4] = int[4](0, 21, 43, 64);
+const int BC7_W3[8] = int[8](0, 9, 18, 27, 37, 46, 55, 64);
+const int BC7_W4[16] = int[16](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+// two-subset partitions (bit i: texel i's subset) and each one's second anchor texel, checked against Godot's own
+// BC7 decoder
+const uint BC7_P2[64] = uint[64](0xCCCCu, 0x8888u, 0xEEEEu, 0xECC8u, 0xC880u, 0xFEECu, 0xFEC8u, 0xEC80u, 0xC800u, 0xFFECu,
+	0xFE80u, 0xE800u, 0xFFE8u, 0xFF00u, 0xFFF0u, 0xF000u, 0xF710u, 0x008Eu, 0x7100u, 0x08CEu, 0x008Cu, 0x7310u, 0x3100u,
+	0x8CCEu, 0x088Cu, 0x3110u, 0x6666u, 0x366Cu, 0x17E8u, 0x0FF0u, 0x718Eu, 0x399Cu, 0xAAAAu, 0xF0F0u, 0x5A5Au, 0x33CCu,
+	0x3C3Cu, 0x55AAu, 0x9696u, 0xA55Au, 0x73CEu, 0x13C8u, 0x324Cu, 0x3BDCu, 0x6996u, 0xC33Cu, 0x9966u, 0x0660u, 0x0272u,
+	0x04E4u, 0x4E40u, 0x2720u, 0xC936u, 0x936Cu, 0x39C6u, 0x639Cu, 0x9336u, 0x9CC6u, 0x817Eu, 0xE718u, 0xCCF0u, 0x0FCCu,
+	0x7744u, 0xEE22u);
+const uint BC7_A2[64] = uint[64](15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u, 15u,
+	15u, 2u, 8u, 2u, 2u, 8u, 8u, 15u, 2u, 8u, 2u, 2u, 8u, 8u, 2u, 2u,
+	15u, 15u, 6u, 8u, 2u, 8u, 15u, 15u, 2u, 8u, 2u, 2u, 2u, 15u, 15u, 6u,
+	6u, 2u, 6u, 8u, 15u, 15u, 2u, 2u, 15u, 15u, 15u, 15u, 15u, 2u, 2u, 15u);
+
+// this thread's 16 texels (one workgroup of 8x8 threads)
+shared vec4 bc7_tx[64 * 16];
+
+vec4 bc7_t(uint i) {
+	return bc7_tx[gl_LocalInvocationIndex * 16u + i];
+}
+
+// 16 indices of up to 4 bits in a uvec2
+uint ix_get(uvec2 v, uint i) {
+	return i < 8u ? (v.x >> (4u * i)) & 15u : (v.y >> (4u * (i - 8u))) & 15u;
+}
+
+uvec2 ix_set(uvec2 v, uint i, uint k) {
+	if (i < 8u) {
+		uint s = 4u * i;
+		v.x = (v.x & ~(15u << s)) | (k << s);
+	} else {
+		uint s = 4u * (i - 8u);
+		v.y = (v.y & ~(15u << s)) | (k << s);
+	}
+	return v;
+}
+
+bool in_subset(uint mask, uint sel, uint i) {
+	return ((mask >> i) & 1u) == sel;
+}
+
+int bc7_weight(uint ib, uint k) {
+	return ib == 2u ? BC7_W2[k] : (ib == 3u ? BC7_W3[k] : BC7_W4[k]);
+}
+
+// A quantised endpoint channel (eb bits, plus p-bit p when hasp) as the 8-bit value the decoder expands it to.
+int bc7_expand(int q, int p, int eb, bool hasp) {
+	int bits = eb + (hasp ? 1 : 0);
+	int v = (hasp ? ((q << 1) | p) : q) << (8 - bits);
+	return v | (v >> bits);
+}
+
+// The quantised value whose expansion is nearest `e` (0..255), for p-bit p.
+int bc7_quant(float e, int p, int eb, bool hasp) {
+	int top = (1 << eb) - 1;
+	int bits = eb + (hasp ? 1 : 0);
+	float f = (e / 255.0) * float((1 << bits) - 1);
+	int q = clamp(int(round(hasp ? (f - float(p)) * 0.5 : f)), 0, top);
+	int best = q;
+	float bd = 1e9;
+	for (int d = -1; d <= 1; d++) {
+		int c = clamp(q + d, 0, top);
+		float x = abs(float(bc7_expand(c, p, eb, hasp)) - e);
+		if (x < bd) {
+			bd = x;
+			best = c;
+		}
+	}
+	return best;
+}
+
+vec4 bc7_pal(ivec4 v0, ivec4 v1, uint ib, uint k) {
+	int w = bc7_weight(ib, k);
+	return vec4(((64 - w) * v0 + w * v1 + 32) >> 6);
+}
+
+struct Bc7Fit {
+	ivec4 q0;
+	ivec4 q1;
+	int p0;
+	int p1;
+	float err;
+};
+
+// Fits subset `sel` (bit i of `mask`: texel i's subset) with one pair of endpoints: `eb`-bit channels, p-bits `pmode`
+// (0 none, 1 one shared by both endpoints, 2 one each), `ib`-bit indices, `nch` channels (3: alpha left out, 255).
+// The subset's indices go into `idx`.
+Bc7Fit bc7_fit(uint mask, uint sel, int nch, int eb, int pmode, uint ib, int refine, inout uvec2 idx) {
+	Bc7Fit f = Bc7Fit(ivec4(0), ivec4(0), 0, 0, 0.0);
+	vec4 chm = nch == 4 ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0);
+	vec4 mean = vec4(0.0);
+	float n = 0.0;
+	for (uint i = 0u; i < 16u; i++) {
+		if (in_subset(mask, sel, i)) {
+			mean += bc7_t(i);
+			n += 1.0;
+		}
+	}
+	if (n == 0.0) {
+		return f;
+	}
+	mean /= n;
+	mat4 m = mat4(0.0);
+	for (uint i = 0u; i < 16u; i++) {
+		if (in_subset(mask, sel, i)) {
+			vec4 d = (bc7_t(i) - mean) * chm;
+			m += outerProduct(d, d);
+		}
+	}
+	vec4 ax = vec4(0.5) * chm;
+	for (int k = 0; k < 8; k++) {
+		vec4 v = m * ax;
+		float l = length(v);
+		if (l < 1e-4) {
+			break;
+		}
+		ax = v / l;
+	}
+	float tmin = 1e9;
+	float tmax = -1e9;
+	for (uint i = 0u; i < 16u; i++) {
+		if (in_subset(mask, sel, i)) {
+			float t = dot((bc7_t(i) - mean) * chm, ax);
+			tmin = min(tmin, t);
+			tmax = max(tmax, t);
+		}
+	}
+	vec4 e0 = clamp(mean + ax * tmin, 0.0, 255.0);
+	vec4 e1 = clamp(mean + ax * tmax, 0.0, 255.0);
+	if (nch == 3) {
+		e0.a = 255.0;
+		e1.a = 255.0;
+	}
+	uint nidx = 1u << ib;
+	bool hasp = pmode > 0;
+	int ncombo = pmode == 2 ? 4 : (pmode == 1 ? 2 : 1);
+	f.err = 1e30;
+	uvec2 bidx = idx;
+	for (int pass = 0; pass <= refine; pass++) {
+		for (int pc = 0; pc < ncombo; pc++) {
+			int p0 = pmode == 2 ? (pc & 1) : pc;
+			int p1 = pmode == 2 ? (pc >> 1) : pc;
+			ivec4 q0;
+			ivec4 q1;
+			ivec4 v0;
+			ivec4 v1;
+			for (int ch = 0; ch < 4; ch++) {
+				q0[ch] = bc7_quant(e0[ch], p0, eb, hasp);
+				q1[ch] = bc7_quant(e1[ch], p1, eb, hasp);
+				v0[ch] = bc7_expand(q0[ch], p0, eb, hasp);
+				v1[ch] = bc7_expand(q1[ch], p1, eb, hasp);
+			}
+			if (nch == 3) {
+				v0.a = 255;
+				v1.a = 255;
+			}
+			float err = 0.0;
+			uvec2 tidx = bidx;
+			for (uint i = 0u; i < 16u; i++) {
+				if (!in_subset(mask, sel, i)) {
+					continue;
+				}
+				vec4 c = bc7_t(i);
+				float bd = 1e30;
+				uint bk = 0u;
+				for (uint k = 0u; k < nidx; k++) {
+					vec4 d = (c - bc7_pal(v0, v1, ib, k)) * chm;
+					float e = dot(d, d);
+					if (e < bd) {
+						bd = e;
+						bk = k;
+					}
+				}
+				err += bd;
+				tidx = ix_set(tidx, i, bk);
+			}
+			if (err < f.err) {
+				f = Bc7Fit(q0, q1, p0, p1, err);
+				bidx = tidx;
+			}
+		}
+		if (pass < refine) {
+			// least squares: the endpoints that best fit these indices (as BC1's)
+			float aa = 0.0;
+			float ab = 0.0;
+			float bb = 0.0;
+			vec4 x0 = vec4(0.0);
+			vec4 x1 = vec4(0.0);
+			for (uint i = 0u; i < 16u; i++) {
+				if (!in_subset(mask, sel, i)) {
+					continue;
+				}
+				float t = float(bc7_weight(ib, ix_get(bidx, i))) / 64.0;
+				float s = 1.0 - t;
+				aa += s * s;
+				ab += s * t;
+				bb += t * t;
+				x0 += s * bc7_t(i);
+				x1 += t * bc7_t(i);
+			}
+			float det = aa * bb - ab * ab;
+			if (det <= 1e-3 * aa * bb || det <= 1e-8) {
+				break;
+			}
+			e0 = clamp((x0 * bb - x1 * ab) / det, 0.0, 255.0);
+			e1 = clamp((x1 * aa - x0 * ab) / det, 0.0, 255.0);
+			if (nch == 3) {
+				e0.a = 255.0;
+				e1.a = 255.0;
+			}
+		}
+	}
+	for (uint i = 0u; i < 16u; i++) {
+		if (in_subset(mask, sel, i)) {
+			idx = ix_set(idx, i, ix_get(bidx, i));
+		}
+	}
+	return f;
+}
+
+// The alpha channel on its own (modes 5 and 4): `eb`-bit endpoints (expanded as colour channels), `ib`-bit indices
+// (into aidx); returns the squared error.
+float bc7_fit_alpha(int eb, uint ib, int refine, out int a0, out int a1, inout uvec2 aidx) {
+	float mn = 255.0;
+	float mx = 0.0;
+	for (uint i = 0u; i < 16u; i++) {
+		mn = min(mn, bc7_t(i).a);
+		mx = max(mx, bc7_t(i).a);
+	}
+	float e0 = mn;
+	float e1 = mx;
+	float best = 1e30;
+	uint nidx = 1u << ib;
+	a0 = 0;
+	a1 = 0;
+	for (int pass = 0; pass <= refine; pass++) {
+		int q0 = bc7_quant(clamp(e0, 0.0, 255.0), 0, eb, false);
+		int q1 = bc7_quant(clamp(e1, 0.0, 255.0), 0, eb, false);
+		int v0 = bc7_expand(q0, 0, eb, false);
+		int v1 = bc7_expand(q1, 0, eb, false);
+		float err = 0.0;
+		uvec2 t = uvec2(0u);
+		float aa = 0.0;
+		float ab = 0.0;
+		float bb = 0.0;
+		float x0 = 0.0;
+		float x1 = 0.0;
+		for (uint i = 0u; i < 16u; i++) {
+			float a = bc7_t(i).a;
+			float bd = 1e30;
+			uint bk = 0u;
+			for (uint k = 0u; k < nidx; k++) {
+				int wk = bc7_weight(ib, k);
+				float v = float(((64 - wk) * v0 + wk * v1 + 32) >> 6);
+				float d = (a - v) * (a - v);
+				if (d < bd) {
+					bd = d;
+					bk = k;
+				}
+			}
+			err += bd;
+			t = ix_set(t, i, bk);
+			float w = float(bc7_weight(ib, bk)) / 64.0;
+			aa += (1.0 - w) * (1.0 - w);
+			ab += (1.0 - w) * w;
+			bb += w * w;
+			x0 += (1.0 - w) * a;
+			x1 += w * a;
+		}
+		if (err < best) {
+			best = err;
+			a0 = q0;
+			a1 = q1;
+			aidx = t;
+		}
+		float det = aa * bb - ab * ab;
+		if (det <= 1e-3 * aa * bb || det <= 1e-8) {
+			break;
+		}
+		e0 = (x0 * bb - x1 * ab) / det;
+		e1 = (x1 * aa - x0 * ab) / det;
+	}
+	return best;
+}
+
+void bc7_put(inout uvec4 b, inout uint pos, uint v, uint n) {
+	uint w = pos >> 5u;
+	uint s = pos & 31u;
+	b[w] |= v << s;
+	if (s + n > 32u) {
+		b[w + 1u] |= v >> (32u - s);
+	}
+	pos += n;
+}
+
+uvec4 bc7_pack6(Bc7Fit f, uvec2 idx) {
+	// the first texel's index must have a clear top bit: else swap the endpoints and mirror the indices
+	bool flip = ix_get(idx, 0u) >= 8u;
+	if (flip) {
+		f = Bc7Fit(f.q1, f.q0, f.p1, f.p0, f.err);
+	}
+	uvec4 b = uvec4(0u);
+	uint pos = 0u;
+	bc7_put(b, pos, 64u, 7u);
+	for (int ch = 0; ch < 4; ch++) {
+		bc7_put(b, pos, uint(f.q0[ch]), 7u);
+		bc7_put(b, pos, uint(f.q1[ch]), 7u);
+	}
+	bc7_put(b, pos, uint(f.p0), 1u);
+	bc7_put(b, pos, uint(f.p1), 1u);
+	for (uint i = 0u; i < 16u; i++) {
+		uint k = ix_get(idx, i);
+		bc7_put(b, pos, flip ? 15u - k : k, i == 0u ? 3u : 4u);
+	}
+	return b;
+}
+
+uvec4 bc7_pack5(Bc7Fit f, uvec2 cidx, int a0, int a1, uvec2 aidx) {
+	bool cflip = ix_get(cidx, 0u) >= 2u;
+	if (cflip) {
+		f = Bc7Fit(f.q1, f.q0, 0, 0, f.err);
+	}
+	bool aflip = ix_get(aidx, 0u) >= 2u;
+	if (aflip) {
+		int t = a0;
+		a0 = a1;
+		a1 = t;
+	}
+	uvec4 b = uvec4(0u);
+	uint pos = 0u;
+	bc7_put(b, pos, 32u, 6u);
+	bc7_put(b, pos, 0u, 2u); // no channel rotation
+	for (int ch = 0; ch < 3; ch++) {
+		bc7_put(b, pos, uint(f.q0[ch]), 7u);
+		bc7_put(b, pos, uint(f.q1[ch]), 7u);
+	}
+	bc7_put(b, pos, uint(a0), 8u);
+	bc7_put(b, pos, uint(a1), 8u);
+	for (uint i = 0u; i < 16u; i++) {
+		uint k = ix_get(cidx, i);
+		bc7_put(b, pos, cflip ? 3u - k : k, i == 0u ? 1u : 2u);
+	}
+	for (uint i = 0u; i < 16u; i++) {
+		uint k = ix_get(aidx, i);
+		bc7_put(b, pos, aflip ? 3u - k : k, i == 0u ? 1u : 2u);
+	}
+	return b;
+}
+
+// Mode 4: 5-bit colour and 6-bit alpha endpoints; index mode 0: colour 2-bit, alpha 3-bit indices; 1: the other way.
+uvec4 bc7_pack4(uint imode, Bc7Fit f, uvec2 cidx, int a0, int a1, uvec2 aidx) {
+	uint cb = imode == 0u ? 2u : 3u;
+	uint ab = imode == 0u ? 3u : 2u;
+	bool cflip = ix_get(cidx, 0u) >= (1u << (cb - 1u));
+	if (cflip) {
+		f = Bc7Fit(f.q1, f.q0, 0, 0, f.err);
+	}
+	bool aflip = ix_get(aidx, 0u) >= (1u << (ab - 1u));
+	if (aflip) {
+		int t = a0;
+		a0 = a1;
+		a1 = t;
+	}
+	uvec4 b = uvec4(0u);
+	uint pos = 0u;
+	bc7_put(b, pos, 16u, 5u);
+	bc7_put(b, pos, 0u, 2u); // no channel rotation
+	bc7_put(b, pos, imode, 1u);
+	for (int ch = 0; ch < 3; ch++) {
+		bc7_put(b, pos, uint(f.q0[ch]), 5u);
+		bc7_put(b, pos, uint(f.q1[ch]), 5u);
+	}
+	bc7_put(b, pos, uint(a0), 6u);
+	bc7_put(b, pos, uint(a1), 6u);
+	// the 2-bit index set first, then the 3-bit one
+	for (uint i = 0u; i < 16u; i++) {
+		uint k = imode == 0u ? ix_get(cidx, i) : ix_get(aidx, i);
+		bool fl = imode == 0u ? cflip : aflip;
+		bc7_put(b, pos, fl ? 3u - k : k, i == 0u ? 1u : 2u);
+	}
+	for (uint i = 0u; i < 16u; i++) {
+		uint k = imode == 0u ? ix_get(aidx, i) : ix_get(cidx, i);
+		bool fl = imode == 0u ? aflip : cflip;
+		bc7_put(b, pos, fl ? 7u - k : k, i == 0u ? 2u : 3u);
+	}
+	return b;
+}
+
+// Two-subset modes: 1 (6-bit RGB, a shared p-bit per subset, 3-bit indices), 3 (7-bit RGB, a p-bit per endpoint,
+// 2-bit) and 7 (5-bit RGBA, a p-bit per endpoint, 2-bit).
+uvec4 bc7_pack2(uint mode, uint part, Bc7Fit s0, Bc7Fit s1, uvec2 idx) {
+	uint mask = BC7_P2[part];
+	uint anc = BC7_A2[part];
+	uint ib = mode == 1u ? 3u : 2u;
+	int nch = mode == 7u ? 4 : 3;
+	uint top = (1u << ib) - 1u;
+	uint half_ = 1u << (ib - 1u);
+	bool flip0 = ix_get(idx, 0u) >= half_;
+	if (flip0) {
+		s0 = Bc7Fit(s0.q1, s0.q0, s0.p1, s0.p0, s0.err);
+	}
+	bool flip1 = ix_get(idx, anc) >= half_;
+	if (flip1) {
+		s1 = Bc7Fit(s1.q1, s1.q0, s1.p1, s1.p0, s1.err);
+	}
+	uvec4 b = uvec4(0u);
+	uint pos = 0u;
+	uint eb = mode == 1u ? 6u : (mode == 3u ? 7u : 5u);
+	bc7_put(b, pos, 1u << mode, mode + 1u);
+	bc7_put(b, pos, part, 6u);
+	for (int ch = 0; ch < nch; ch++) {
+		bc7_put(b, pos, uint(s0.q0[ch]), eb);
+		bc7_put(b, pos, uint(s0.q1[ch]), eb);
+		bc7_put(b, pos, uint(s1.q0[ch]), eb);
+		bc7_put(b, pos, uint(s1.q1[ch]), eb);
+	}
+	if (mode == 1u) {
+		bc7_put(b, pos, uint(s0.p0), 1u);
+		bc7_put(b, pos, uint(s1.p0), 1u);
+	} else {
+		bc7_put(b, pos, uint(s0.p0), 1u);
+		bc7_put(b, pos, uint(s0.p1), 1u);
+		bc7_put(b, pos, uint(s1.p0), 1u);
+		bc7_put(b, pos, uint(s1.p1), 1u);
+	}
+	for (uint i = 0u; i < 16u; i++) {
+		uint k = ix_get(idx, i);
+		bool fl = in_subset(mask, 0u, i) ? flip0 : flip1;
+		bc7_put(b, pos, fl ? top - k : k, (i == 0u || i == anc) ? ib - 1u : ib);
+	}
+	return b;
+}
+
+// How badly one line per subset fits partition `mask`: what's left of each subset's spread off its main axis (RGB,
+// or RGBA with `alpha`).
+float bc7_part_cost(uint mask, bool alpha) {
+	vec4 chm = alpha ? vec4(1.0) : vec4(1.0, 1.0, 1.0, 0.0);
+	float cost = 0.0;
+	for (uint sel = 0u; sel < 2u; sel++) {
+		vec4 mean = vec4(0.0);
+		float n = 0.0;
+		for (uint i = 0u; i < 16u; i++) {
+			if (in_subset(mask, sel, i)) {
+				mean += bc7_t(i);
+				n += 1.0;
+			}
+		}
+		if (n < 2.0) {
+			continue;
+		}
+		mean /= n;
+		mat4 m = mat4(0.0);
+		for (uint i = 0u; i < 16u; i++) {
+			if (in_subset(mask, sel, i)) {
+				vec4 d = (bc7_t(i) - mean) * chm;
+				m += outerProduct(d, d);
+			}
+		}
+		vec4 v = vec4(0.5) * chm;
+		float l = 0.0;
+		for (int k = 0; k < 4; k++) {
+			vec4 nv = m * v;
+			l = length(nv);
+			if (l < 1e-4) {
+				break;
+			}
+			v = nv / l;
+		}
+		cost += max(0.0, m[0][0] + m[1][1] + m[2][2] + m[3][3] - l);
+	}
+	return cost;
+}
+
+// The `keep` (1, 2, 4 or 8) partitions whose estimate is lowest, best first, as 6-bit numbers packed in a uvec2
+// (no array: see above).
+uvec2 bc7_rank(bool alpha, int keep) {
+	uvec2 pn = uvec2(0u);
+	vec4 c0 = vec4(1e30); // the costs of places 0-3 and 4-7
+	vec4 c1 = vec4(1e30);
+	for (uint p = 0u; p < 64u; p++) {
+		float e = bc7_part_cost(BC7_P2[p], alpha);
+		float worst = keep > 4 ? c1[keep - 5] : c0[keep - 1];
+		if (e >= worst) {
+			continue;
+		}
+		// insert at its place, the rest move down one
+		int j = keep - 1;
+		while (j > 0) {
+			float prev = j - 1 >= 4 ? c1[j - 5] : c0[j - 1];
+			if (prev <= e) {
+				break;
+			}
+			if (j >= 4) {
+				c1[j - 4] = prev;
+			} else {
+				c0[j] = prev;
+			}
+			uint pv = j - 1 >= 4 ? (pn.y >> (6u * uint(j - 5))) & 63u : (pn.x >> (6u * uint(j - 1))) & 63u;
+			if (j >= 4) {
+				pn.y = (pn.y & ~(63u << (6u * uint(j - 4)))) | (pv << (6u * uint(j - 4)));
+			} else {
+				pn.x = (pn.x & ~(63u << (6u * uint(j)))) | (pv << (6u * uint(j)));
+			}
+			j--;
+		}
+		if (j >= 4) {
+			c1[j - 4] = e;
+			pn.y = (pn.y & ~(63u << (6u * uint(j - 4)))) | (p << (6u * uint(j - 4)));
+		} else {
+			c0[j] = e;
+			pn.x = (pn.x & ~(63u << (6u * uint(j)))) | (p << (6u * uint(j)));
+		}
+	}
+	return pn;
+}
+
+uint rank_get(uvec2 pn, int j) {
+	return j >= 4 ? (pn.y >> (6u * uint(j - 4))) & 63u : (pn.x >> (6u * uint(j))) & 63u;
+}
+
+uvec4 encode_bc7(bool alpha, uint quality, int refine) {
+	uvec2 idx = uvec2(0u);
+	Bc7Fit f6 = bc7_fit(0u, 0u, 4, 7, 2, 4u, refine, idx);
+	uvec4 best = bc7_pack6(f6, idx);
+	float best_err = f6.err;
+	if (quality == 0u || best_err == 0.0) {
+		return best;
+	}
+	if (alpha) {
+		// mode 5: 7-bit colour, 8-bit alpha, 2-bit indices each
+		uvec2 cidx = uvec2(0u);
+		uvec2 aidx = uvec2(0u);
+		Bc7Fit fc = bc7_fit(0u, 0u, 3, 7, 0, 2u, refine, cidx);
+		int a0;
+		int a1;
+		float ea = bc7_fit_alpha(8, 2u, refine, a0, a1, aidx);
+		if (fc.err + ea < best_err) {
+			best_err = fc.err + ea;
+			best = bc7_pack5(fc, cidx, a0, a1, aidx);
+		}
+		// mode 4: 5-bit colour, 6-bit alpha with the finer indices (and at quality 2 the other way round too)
+		for (uint imode = 0u; imode < (quality >= 2u ? 2u : 1u); imode++) {
+			uvec2 c4 = uvec2(0u);
+			uvec2 a4 = uvec2(0u);
+			Bc7Fit f4 = bc7_fit(0u, 0u, 3, 5, 0, imode == 0u ? 2u : 3u, refine, c4);
+			int b0;
+			int b1;
+			float e4 = bc7_fit_alpha(6, imode == 0u ? 3u : 2u, refine, b0, b1, a4);
+			if (f4.err + e4 < best_err) {
+				best_err = f4.err + e4;
+				best = bc7_pack4(imode, f4, c4, b0, b1, a4);
+			}
+		}
+		if (quality >= 2u) {
+			// mode 7: two subsets with alpha
+			uvec2 pn = bc7_rank(true, 4);
+			for (int j = 0; j < 4; j++) {
+				uint p = rank_get(pn, j);
+				uvec2 pidx = uvec2(0u);
+				Bc7Fit s0 = bc7_fit(BC7_P2[p], 0u, 4, 5, 2, 2u, refine, pidx);
+				Bc7Fit s1 = bc7_fit(BC7_P2[p], 1u, 4, 5, 2, 2u, refine, pidx);
+				if (s0.err + s1.err < best_err) {
+					best_err = s0.err + s1.err;
+					best = bc7_pack2(7u, p, s0, s1, pidx);
+				}
+			}
+		}
+		return best;
+	}
+	// the likeliest partitions first (cheapest estimate), then the full fit on the top few
+	int keep = quality == 1u ? 2 : 8;
+	uvec2 pn = bc7_rank(false, keep);
+	for (int j = 0; j < keep; j++) {
+		uint p = rank_get(pn, j);
+		uint mask = BC7_P2[p];
+		uvec2 pidx = uvec2(0u);
+		Bc7Fit s0 = bc7_fit(mask, 0u, 3, 6, 1, 3u, refine, pidx);
+		Bc7Fit s1 = bc7_fit(mask, 1u, 3, 6, 1, 3u, refine, pidx);
+		if (s0.err + s1.err < best_err) {
+			best_err = s0.err + s1.err;
+			best = bc7_pack2(1u, p, s0, s1, pidx);
+		}
+		if (quality >= 2u && j < 4) {
+			uvec2 qidx = uvec2(0u);
+			Bc7Fit t0 = bc7_fit(mask, 0u, 3, 7, 2, 2u, refine, qidx);
+			Bc7Fit t1 = bc7_fit(mask, 1u, 3, 7, 2, 2u, refine, qidx);
+			if (t0.err + t1.err < best_err) {
+				best_err = t0.err + t1.err;
+				best = bc7_pack2(3u, p, t0, t1, qidx);
+			}
+		}
+	}
+	return best;
+}
+
+#endif
+
 // --- main ---------------------------------------------------------------------------------------------------------
 
 vec4 texel(uint sel, uint ofs, uint x, uint y, uint w) {
@@ -398,7 +1091,7 @@ void main() {
 		return;
 	}
 	uint sel = lv[e], ofs = lv[e + 1u], mode = lv[e + 4u];
-	uint at = lv[e + 6u] + (uint(blk.y) * uint(blocks.x) + uint(blk.x)) * (mode == 0u ? 2u : 4u);
+	uint at = lv[e + 6u] + (uint(blk.y) * uint(blocks.x) + uint(blk.x)) * (mode == 0u ? 2u : (mode == 5u ? 16u : 4u));
 	vec4 px[16];
 	for (int i = 0; i < 16; i++) {
 		uvec2 p = min(uvec2(blk * 4 + ivec2(i & 3, i >> 2)), uvec2(w - 1u, h - 1u));
@@ -426,13 +1119,13 @@ void main() {
 #ifdef ETC
 		uvec4 q = uvec4(encode_eac(a, false), encode_etc(c));
 #else
-		uvec4 q = uvec4(encode_bc4(a), encode_bc1(c, params.refine));
+		uvec4 q = uvec4(encode_bc4(a, (params.flags & 1u) != 0u), encode_bc1(c, params.refine));
 #endif
 		bout[at] = q.x;
 		bout[at + 1u] = q.y;
 		bout[at + 2u] = q.z;
 		bout[at + 3u] = q.w;
-	} else {
+	} else if (mode == 2u) {
 		float r[16];
 		float g[16];
 		for (int i = 0; i < 16; i++) {
@@ -442,11 +1135,34 @@ void main() {
 #ifdef ETC
 		uvec4 q = uvec4(encode_eac(r, true), encode_eac(g, true));
 #else
-		uvec4 q = uvec4(encode_bc4(r), encode_bc4(g));
+		uvec4 q = uvec4(encode_bc4(r, (params.flags & 1u) != 0u), encode_bc4(g, (params.flags & 1u) != 0u));
 #endif
 		bout[at] = q.x;
 		bout[at + 1u] = q.y;
 		bout[at + 2u] = q.z;
 		bout[at + 3u] = q.w;
+	} else if (mode == 5u) {
+		// the decoded texels themselves, in rows (the level's space is at least w * h words)
+		for (int i = 0; i < 16; i++) {
+			uvec2 p = uvec2(blk * 4 + ivec2(i & 3, i >> 2));
+			if (p.x < w && p.y < h) {
+				bout[lv[e + 6u] + p.y * w + p.x] = packUnorm4x8(px[i]);
+			}
+		}
+	} else {
+#ifdef BC7
+		for (int i = 0; i < 16; i++) {
+			vec4 c = px[i] * 255.0;
+			if (mode == 3u) {
+				c.a = 255.0;
+			}
+			bc7_tx[gl_LocalInvocationIndex * 16u + uint(i)] = c;
+		}
+		uvec4 q = encode_bc7(mode == 4u, params.quality, params.refine);
+		bout[at] = q.x;
+		bout[at + 1u] = q.y;
+		bout[at + 2u] = q.z;
+		bout[at + 3u] = q.w;
+#endif
 	}
 }
